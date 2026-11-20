@@ -1,0 +1,4 @@
+{
+  "ops": {"password": "REPLACE with output of: python -m ams.passwords \"your-password\""},
+  "manager": {"password": "REPLACE with output of: python -m ams.passwords \"another-password\""}
+}
