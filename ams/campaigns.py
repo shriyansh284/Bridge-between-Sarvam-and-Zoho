@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +30,7 @@ from .store import (
     new_campaign_id,
     save_campaign,
 )
-from .timeutil import fmt_local, iso, next_allowed_time, parse_iso, utcnow
+from .timeutil import fmt_local, iso, next_allowed_time, parse_iso, stamp, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -267,13 +267,35 @@ def trigger_blocked(cid: str, row_id: str, ref: str, message: str) -> None:
         refresh_status(camp)
 
 
-def flag_stale(camp: dict, now) -> int:
-    """Inside a campaign_tx: attempts with no result in time -> needs_review."""
+def trigger_uncertain(cid: str, row_id: str, ref: str, message: str) -> None:
+    """Sarvam may have placed the call but never confirmed it (timeout after sending, gateway error).
+    Calling again could reach the candidate twice, so the row goes to review instead of being redialled."""
+    with campaign_tx(cid) as camp:
+        row = row_by_id(camp, row_id)
+        att = next(a for a in row["attempts"] if a["ref"] == ref)
+        att["status"] = "no_result"
+        att["failure_reason"] = f"Sarvam didn't confirm the call; it may have been placed ({message[:200]})"
+        row["status"] = "needs_review"
+        row["note"] = "Sarvam didn't confirm this call, so it may have gone out. Check the Sarvam dashboard before calling again."
+        row["attempt_count"] = _placed(row)
+        refresh_status(camp)
+
+
+def flag_stale(camp: dict, now, results_ok_at=None, seen: frozenset = frozenset()) -> int:
+    """Inside a campaign_tx: attempts with no result in time -> needs_review.
+
+    A placed call is only given up on after a SUCCESSFUL result lookup ran past its deadline and still
+    didn't find it (results_ok_at). While Sarvam's results can't be read, calls just keep waiting: a
+    temporary outage must not turn real results into "under review" and send a wrong final file.
+    A call Sarvam does list (`seen`: still ringing, or its transcript isn't saved yet) gets twice as long."""
     flagged = 0
+    timeout = timedelta(minutes=settings.result_timeout_minutes)
     for row in camp["rows"]:
         for att in row["attempts"]:
             started = parse_iso(att["triggered_at"])
-            late = (att["status"] == "awaiting_result" and started < now - timedelta(minutes=settings.result_timeout_minutes)) \
+            limit = timeout * 2 if att.get("sarvam_attempt_id") in seen else timeout
+            late = (att["status"] == "awaiting_result" and started < now - limit
+                    and results_ok_at is not None and results_ok_at >= started + limit) \
                 or (att["status"] == "triggering" and started < now - timedelta(minutes=10))
             if late:
                 att["status"] = "no_result"
@@ -293,11 +315,16 @@ LATE_RESULT_HOURS = 24  # calls marked "under review" are still looked up this l
 
 
 def awaiting_attempts(now) -> list[dict]:
-    """Placed calls whose result hasn't arrived yet, in campaigns that are still open."""
+    """Placed calls whose result hasn't arrived yet. Includes calls already marked "under review" for
+    LATE_RESULT_HOURS, even in campaigns whose final file was sent: a late result reopens the campaign
+    and a corrected final file follows."""
     out = []
+    recent = now - timedelta(hours=LATE_RESULT_HOURS)
     for cid in list_campaign_ids():
-        if (campaign_dir(cid) / ".done").exists():
-            continue
+        done_marker = campaign_dir(cid) / ".done"
+        done = done_marker.exists()
+        if done and datetime.fromtimestamp(done_marker.stat().st_mtime, timezone.utc).replace(tzinfo=None) < recent:
+            continue  # closed long ago: nothing can still be late
         camp = load_campaign(cid) or {}
         if camp.get("status") == "rejected":
             continue
@@ -305,9 +332,9 @@ def awaiting_attempts(now) -> list[dict]:
             for att in row["attempts"]:
                 if not att.get("sarvam_attempt_id"):
                     continue
-                late = att["status"] == "no_result" and parse_iso(att["triggered_at"]) > now - timedelta(hours=LATE_RESULT_HOURS)
-                if att["status"] == "awaiting_result" or late:
-                    out.append({"campaign_id": cid, "row_id": row["row_id"], "ref": att["ref"],
+                late = att["status"] == "no_result" and parse_iso(att["triggered_at"]) > recent
+                if (att["status"] == "awaiting_result" and not done) or late:
+                    out.append({"campaign_id": cid, "row_id": row["row_id"], "ref": att["ref"], "status": att["status"],
                                 "sarvam_attempt_id": att["sarvam_attempt_id"], "triggered_at": att["triggered_at"]})
     return out
 
@@ -362,13 +389,21 @@ def apply_result(payload: dict) -> str:
         if n["attempt_id"] and not att.get("sarvam_attempt_id"):
             att["sarvam_attempt_id"] = str(n["attempt_id"])
         row["attempt_count"] = _placed(row)
-        if att is not row["attempts"][-1] or row["status"] == "cancelled":
-            return "processed_old_attempt"
+        status_before = row["status"]
+        # An earlier attempt that turns out to have connected (e.g. a late result after "Call again")
+        earlier = next((a for a in row["attempts"] if a is not att and a["status"] == "connected"), None)
 
-        if att["status"] == "connected":
+        if att is not row["attempts"][-1] or row["status"] == "cancelled":
+            if att["status"] != "connected" or row["status"] in ("completed", "cancelled"):
+                return "processed_old_attempt"
+            # The candidate already had the conversation: don't leave the row as unreachable or call again
+            row.update(status="completed", outcome=att["variables"], note="Connected on an earlier attempt")
+        elif att["status"] == "connected":
             row["status"] = "completed"
             row["outcome"] = att["variables"]
             row["note"] = ""
+        elif earlier:
+            row.update(status="completed", outcome=earlier["variables"], note="Connected on an earlier attempt")
         elif att["status"] in ("no_answer", "busy"):
             if row["attempt_count"] < settings.max_attempts:
                 row["status"] = "retry_scheduled"
@@ -380,6 +415,8 @@ def apply_result(payload: dict) -> str:
         else:
             row["status"] = "failed"
             row["note"] = att["failure_reason"] or "Call could not be placed"
+        if camp.get("final_sent") and row["status"] != status_before:
+            reopen(camp)  # a late result changed a row after the final file went out: send a corrected one
         refresh_status(camp)
     return "processed"
 
@@ -436,8 +473,14 @@ def slot_label(slot: str) -> str:
 
 # ---------------------------------------------------------------- dashboard actions
 def reopen(camp: dict) -> None:
-    """Inside a campaign_tx: a finished campaign gets more calls, so a new final file will follow."""
+    """Inside a campaign_tx: a finished campaign changed (more calls, or a late result), so a new final
+    file will follow. A final that is queued but not yet sent is dropped: it would show the old state and
+    would wrongly mark the campaign finished. One that is being sent right now is caught by reopened_at."""
     camp["final_sent"] = False
+    camp["reopened_at"] = stamp()
+    for e in camp["emails"]:
+        if e["kind"] == "final" and e["status"] in ("pending", "failed"):
+            e["status"] = "superseded"
     (campaign_dir(camp["campaign_id"]) / ".done").unlink(missing_ok=True)
 
 

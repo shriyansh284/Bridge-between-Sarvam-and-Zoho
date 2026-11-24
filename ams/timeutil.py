@@ -18,6 +18,11 @@ def iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
+def stamp() -> str:
+    """Naive-UTC ISO time with microseconds, for ordering events that happen within the same second."""
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="microseconds")
+
+
 def parse_iso(text: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(text) if text else None
 

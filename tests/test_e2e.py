@@ -353,13 +353,132 @@ def test_no_public_address_results_are_fetched_from_sarvam():
         object.__setattr__(settings, "public_base_url", original)
 
 
+def _campaign_for(mid):
+    return next(c for c in list_campaign_ids() if (load_campaign(c).get("email") or {}).get("message_id") == mid)
+
+
+def test_sarvam_outage_never_turns_real_results_into_a_wrong_final(monkeypatch):
+    """Results can't be read for an hour: nothing is given up. Then the call isn't listed yet, so it goes
+    to review and a final goes out. Then it turns up: the row is corrected and a corrected final follows."""
+    from ams import results
+    from ams.config import settings
+    from ams.sarvam import SarvamError
+
+    original = settings.public_base_url
+    object.__setattr__(settings, "public_base_url", "")  # no webhook: results only by fetching
+    results._last_ok, results._seen = None, set()
+    real_fetch = results.fetch_attempts
+    try:
+        def down(ids, since):
+            raise SarvamError("Sarvam API 503: unavailable", retryable=True, status_code=503)
+        monkeypatch.setattr(results, "fetch_attempts", down)
+        mid = _inject(_xlsx([["L1", "Lata", "9876500080", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]]), "late.xlsx")
+        mailer.poll_inbox()
+        cid = _campaign_for(mid)
+        _run_until(lambda: (load_campaign(cid)["rows"][0]["attempts"] or [{}])[-1].get("sarvam_attempt_id"))
+        time.sleep(1)  # the call has finished at (mock) Sarvam
+        with campaign_tx(cid) as camp:  # pretend it was placed an hour ago
+            camp["rows"][0]["attempts"][-1]["triggered_at"] = iso(utcnow() - timedelta(minutes=60))
+        for _ in range(3):
+            scheduler.run_cycle()
+        camp = load_campaign(cid)
+        assert camp["rows"][0]["status"] == "calling" and not camp["final_sent"]  # outage: nothing given up
+
+        monkeypatch.setattr(results, "fetch_attempts", lambda ids, since: [])  # back, but not listing it yet
+        _run_until(lambda: load_campaign(cid)["final_sent"])
+        assert load_campaign(cid)["rows"][0]["status"] == "needs_review"
+
+        monkeypatch.setattr(results, "fetch_attempts", real_fetch)  # the record turns up late
+        _run_until(lambda: load_campaign(cid)["rows"][0]["status"] == "completed" and load_campaign(cid)["final_sent"])
+        finals = [e for e in load_campaign(cid)["emails"] if e["kind"] == "final"]
+        assert len(finals) == 2 and all(e["status"] == "sent" for e in finals)
+        corrected = [m for m in _outbox() if m["in_reply_to"] == mid][-1]
+        _, got = _rows(load_workbook(io.BytesIO(_attachment(corrected)))["Candidates"])
+        assert got["L1"]["Call Status"] == "Connected" and got["L1"]["Candidate Response"] == "Agreed to submit"
+    finally:
+        object.__setattr__(settings, "public_base_url", original)
+
+
+def test_unconfirmed_call_goes_to_review_and_is_never_dialled_again(monkeypatch):
+    from ams.sarvam import SarvamError
+
+    def no_answer_from_sarvam(*args, **kwargs):
+        raise SarvamError("Sarvam didn't answer in 30 s", retryable=False, uncertain=True)
+    monkeypatch.setattr(scheduler, "place_call", no_answer_from_sarvam)
+    mid = _inject(_xlsx([["U1", "Uma", "9876500090", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]]), "unconfirmed.xlsx")
+    mailer.poll_inbox()
+    cid = _campaign_for(mid)
+    scheduler.place_due_calls()
+    scheduler.place_due_calls()
+    row = load_campaign(cid)["rows"][0]
+    assert row["status"] == "needs_review" and len(row["attempts"]) == 1 and row["attempt_count"] == 1
+    assert "may have gone out" in row["note"]
+
+
+def test_an_earlier_attempt_that_connected_wins_over_a_later_miss():
+    from ams.campaigns import apply_result
+
+    later = (datetime.now(LOCAL_TZ) + timedelta(hours=3)).strftime("%d-%m-%Y")
+    mid = _inject(_xlsx([["E9", "Esha", "9876500095", "ABC", "PAN", "18-11-2026", later, "11:00 AM", "", ""]]), "earlier.xlsx")
+    mailer.poll_inbox()
+    cid = _campaign_for(mid)
+    with campaign_tx(cid) as camp:  # attempt 1 got no result in time; "Call again" placed attempt 2
+        row = camp["rows"][0]
+        row["attempts"] = [
+            {"ref": "a1", "number": 1, "status": "no_result", "triggered_at": iso(utcnow() - timedelta(hours=1)), "sarvam_attempt_id": "S-1"},
+            {"ref": "a2", "number": 2, "status": "awaiting_result", "triggered_at": iso(utcnow()), "sarvam_attempt_id": "S-2"}]
+        row["status"] = "calling"
+    meta = lambda ref: {"metadata": {"campaign_id": cid, "row_id": "R0001", "ref": ref}}  # noqa: E731
+    assert apply_result({"attempt_id": "S-1", "status": "connected", "final_agent_variables": {"disposition_call_disposition": "agreed_to_submit"},
+                         "webhook_config": meta("a1")}) == "processed"
+    assert load_campaign(cid)["rows"][0]["status"] == "completed"
+    apply_result({"attempt_id": "S-2", "status": "no_answer", "webhook_config": meta("a2")})
+    row = load_campaign(cid)["rows"][0]
+    assert row["status"] == "completed" and row["outcome"]["disposition_call_disposition"] == "agreed_to_submit"
+
+
+def test_email_cut_off_mid_send_is_retried():
+    later = (datetime.now(LOCAL_TZ) + timedelta(hours=3)).strftime("%d-%m-%Y")
+    mid = _inject(_xlsx([["S1", "Sana", "9876500096", "ABC", "PAN", "18-11-2026", later, "11:00 AM", "", ""]]), "stuck.xlsx")
+    mailer.poll_inbox()
+    cid = _campaign_for(mid)
+    scheduler.run_cycle()  # ack
+    with campaign_tx(cid) as camp:  # an update was being sent when the server restarted
+        camp["emails"].append({"key": "update-7", "kind": "update", "update_no": 7, "status": "sending", "failures": 0,
+                               "created_at": iso(utcnow() - timedelta(minutes=30)),
+                               "sending_at": iso(utcnow() - timedelta(minutes=30))})
+    mailer.send_due_emails()
+    rec = next(e for e in load_campaign(cid)["emails"] if e["key"] == "update-7")
+    assert rec["status"] == "sent" and rec["failures"] == 1
+    assert any("Update-7" in a["name"] for m in _outbox() if m["in_reply_to"] == mid for a in m["attachments"])
+
+
+def test_a_final_composed_before_call_again_does_not_close_the_campaign():
+    from ams.campaigns import row_action
+
+    cid = next(c for c in list_campaign_ids() if load_campaign(c)["final_sent"]
+               and any(r["status"] == "failed" for r in load_campaign(c)["rows"]))
+    with campaign_tx(cid) as camp:  # pretend the final was still on its way...
+        camp["final_sent"] = False
+        camp["emails"].append({"key": "final-9", "kind": "final", "status": "sending", "failures": 0,
+                               "created_at": iso(utcnow()), "sending_at": mailer.stamp()})
+        index = len(camp["emails"]) - 1
+    row = next(r for r in load_campaign(cid)["rows"] if r["status"] == "failed")
+    row_action(cid, row["row_id"], "call_again")  # ...when the operator pressed Call again
+    mailer._send_one(cid, index)
+    camp = load_campaign(cid)
+    assert camp["emails"][index]["status"] == "sent" and not camp["final_sent"]  # a new final is still owed
+    _run_until(lambda: load_campaign(cid)["final_sent"])
+
+
 def test_call_again_after_final_sends_a_new_final():
     from ams.campaigns import row_action
     cid = next(c for c in list_campaign_ids() if load_campaign(c)["final_sent"]
                and any(r["status"] == "not_reachable" for r in load_campaign(c)["rows"]))
     row = next(r for r in load_campaign(cid)["rows"] if r["status"] == "not_reachable")
+    finals_before = sum(1 for e in load_campaign(cid)["emails"] if e["kind"] == "final")
     assert "queued" in row_action(cid, row["row_id"], "call_again")
     assert not (campaign_dir(cid) / ".done").exists()
     _run_until(lambda: load_campaign(cid)["final_sent"])
     finals = [e for e in load_campaign(cid)["emails"] if e["kind"] == "final"]
-    assert len(finals) == 2 and all(e["status"] == "sent" for e in finals)
+    assert len(finals) == finals_before + 1 and finals[-1]["status"] == "sent"

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import html
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +24,7 @@ from .excel_out import build_results, output_name
 from .sheet import CLIENT_FORMAT, SheetError
 from .store import (STATE, append_log, campaign_dir, campaign_tx, get_status, list_campaign_ids, load_campaign, lock,
                     read_json, set_status, write_json)
-from .timeutil import fmt_local, iso, parse_iso, utcnow
+from .timeutil import fmt_local, iso, parse_iso, stamp, utcnow
 from .zoho import ZohoError, client, extract_email, sender_allowed
 
 log = logging.getLogger(__name__)
@@ -294,6 +294,9 @@ def compose(camp: dict, rec: dict) -> tuple[str, str, Optional[tuple[str, bytes]
     return subject, intro + summary + outro, attach
 
 
+STUCK_SENDING_MINUTES = 10  # an email still "sending" after this long was cut off (restart, crash): retry it
+
+
 def send_due_emails() -> int:
     """Queue any due update/final emails, then send everything pending. Returns emails sent."""
     sent = 0
@@ -301,17 +304,22 @@ def send_due_emails() -> int:
         if (campaign_dir(cid) / ".done").exists():
             continue
         with campaign_tx(cid) as camp:
+            stuck_before = utcnow() - timedelta(minutes=STUCK_SENDING_MINUTES)
+            for e in camp["emails"]:
+                if e["status"] == "sending" and parse_iso(e.get("sending_at") or e["created_at"]) < stuck_before:
+                    e.update(status="failed", failures=e["failures"] + 1,
+                             error="Interrupted while sending (restart?); it may already have been delivered")
             decide_emails(camp)
             pending = [i for i, e in enumerate(camp["emails"])
                        if e["status"] in ("pending", "failed") and e["failures"] < settings.max_email_failures]
             for i in pending:
                 camp["emails"][i]["status"] = "sending"
-                camp["emails"][i]["sending_at"] = iso(utcnow())
+                camp["emails"][i]["sending_at"] = stamp()
         for i in pending:
             sent += _send_one(cid, i)
-        camp = load_campaign(cid)
-        if camp and _campaign_closed(camp):
-            (campaign_dir(cid) / ".done").touch()
+        with campaign_tx(cid) as camp:  # under the lock, so "Call again" can't slip in between check and marker
+            if _campaign_closed(camp):
+                (campaign_dir(cid) / ".done").touch()
     return sent
 
 
@@ -350,7 +358,9 @@ def _send_one(cid: str, index: int) -> int:
         rec["file"] = saved or rec.get("file")
         if ok or saved_only:
             rec.update(status="sent" if ok else "saved", sent_at=iso(utcnow()), error=None)
-            if rec["kind"] == "final":
+            # A final composed before the campaign was reopened ("Call again", a late result) is out of date:
+            # it doesn't finish the campaign, so the corrected final still follows.
+            if rec["kind"] == "final" and (rec.get("sending_at") or "") > (camp.get("reopened_at") or ""):
                 camp["final_sent"] = True
         else:
             rec.update(status="failed", failures=rec["failures"] + 1, error=error)

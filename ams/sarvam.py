@@ -33,10 +33,21 @@ TIMEOUT = 30
 
 
 class SarvamError(Exception):
-    def __init__(self, message: str, retryable: bool, status_code: Optional[int] = None):
+    """retryable: safe to try again. uncertain: Sarvam may have acted on the request although we got
+    no answer (e.g. a read timeout after sending), so placing the call again could call someone twice."""
+
+    def __init__(self, message: str, retryable: bool, status_code: Optional[int] = None, uncertain: bool = False):
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
+        self.uncertain = uncertain
+
+
+def _never_sent(exc: Exception) -> bool:
+    """True when the request certainly never reached Sarvam (DNS failure, connection refused)."""
+    text = repr(exc)
+    return any(s in text for s in ("NewConnectionError", "NameResolutionError", "Failed to resolve",
+                                   "Name or service not known", "getaddrinfo failed", "Connection refused"))
 
 
 def _headers() -> dict:
@@ -85,7 +96,10 @@ def _analytics_url(path: str) -> str:
             f"{settings.sarvam_workspace_id}/{settings.sarvam_app_id}/{path}")
 
 
-def _analytics_get(path: str, params: Optional[dict] = None, timeout: int = TIMEOUT) -> dict:
+ANALYTICS_TIMEOUT = 15  # short: these lookups run inside the loop that also places calls and sends emails
+
+
+def _analytics_get(path: str, params: Optional[dict] = None, timeout: int = ANALYTICS_TIMEOUT) -> dict:
     try:
         resp = requests.get(_analytics_url(path), headers=_headers(), params=params, timeout=timeout)
     except requests.RequestException as exc:
@@ -99,23 +113,25 @@ def _analytics_get(path: str, params: Optional[dict] = None, timeout: int = TIME
         raise SarvamError(f"Unexpected Sarvam response: {resp.text[:300]}", retryable=True) from exc
 
 
-def fetch_attempts(attempt_ids: list[str], since: datetime, batch: int = 50) -> list[dict]:
-    """Analytics records for our own calls, found by the attempt_id Sarvam returned when each call
-    was placed. `since` (naive UTC) bounds the search; a call can show up a few minutes after it ends."""
+ATTEMPT_BATCH = 20  # attempt IDs per lookup: keeps the request URL around 3 KB
+
+
+def fetch_attempts(attempt_ids: list[str], since: datetime) -> list[dict]:
+    """Analytics records for some of our own calls (at most ATTEMPT_BATCH), found by the attempt_id Sarvam
+    returned when each call was placed. `since` (naive UTC) bounds the search."""
     end = (utcnow() + timedelta(minutes=10)).isoformat()
+    conditions = [{"field": "attempt_id", "operator": "equals", "value": str(a)} for a in attempt_ids]
     found: list[dict] = []
-    for i in range(0, len(attempt_ids), batch):
-        conditions = [{"field": "attempt_id", "operator": "equals", "value": str(a)} for a in attempt_ids[i:i + batch]]
-        offset = 0
-        while True:
-            data = _analytics_get("attempts", {
-                "start_datetime": since.isoformat(), "end_datetime": end, "limit": 1000, "offset": offset,
-                "filter_conditions": json.dumps(conditions)})
-            items = data.get("items") or []
-            found.extend(items)
-            if len(items) < 1000 or offset >= 9000:
-                break
-            offset += 1000
+    offset = 0
+    while True:
+        data = _analytics_get("attempts", {
+            "start_datetime": since.isoformat(), "end_datetime": end, "limit": 1000, "offset": offset,
+            "filter_conditions": json.dumps(conditions)})
+        items = data.get("items") or []
+        found.extend(items)
+        if len(items) < 1000 or offset >= 9000:
+            break
+        offset += 1000
     return found
 
 
@@ -138,18 +154,29 @@ def place_call(phone_e164: str, agent_variables: dict, app_overrides: Optional[d
     payload = build_outbound_payload(phone_e164, agent_variables, app_overrides, metadata)
     try:
         resp = requests.post(url, json=payload, headers=_headers(), timeout=TIMEOUT)
+    except requests.ConnectTimeout as exc:  # never connected: nothing was sent
+        raise SarvamError(f"Couldn't connect to Sarvam: {exc}", retryable=True) from exc
+    except requests.ConnectionError as exc:
+        if _never_sent(exc):
+            raise SarvamError(f"Couldn't connect to Sarvam: {exc}", retryable=True) from exc
+        raise SarvamError(f"Connection to Sarvam dropped after sending: {exc}", retryable=False, uncertain=True) from exc
+    except requests.Timeout as exc:  # sent, but no answer in time: the call may be going out
+        raise SarvamError(f"Sarvam didn't answer in {TIMEOUT} s: {exc}", retryable=False, uncertain=True) from exc
     except requests.RequestException as exc:
-        raise SarvamError(f"Network error reaching Sarvam: {exc}", retryable=True) from exc
+        raise SarvamError(f"Error calling Sarvam: {exc}", retryable=False, uncertain=True) from exc
 
     if 200 <= resp.status_code < 300:
         try:
             attempt_id = resp.json()["attempt_id"]
-        except (ValueError, KeyError) as exc:
-            raise SarvamError(f"Unexpected Sarvam response: {resp.text[:300]}", retryable=False) from exc
+        except (ValueError, KeyError) as exc:  # accepted, but we can't tell which call it is
+            raise SarvamError(f"Unexpected Sarvam response: {resp.text[:300]}", retryable=False, uncertain=True) from exc
         return str(attempt_id)
 
-    retryable = resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500
-    raise SarvamError(f"Sarvam API {resp.status_code}: {resp.text[:500]}", retryable, resp.status_code)
+    code = resp.status_code
+    if code in (500, 502, 504):  # the request may have been processed before the error
+        raise SarvamError(f"Sarvam API {code}: {resp.text[:500]}", retryable=False, status_code=code, uncertain=True)
+    retryable = code in (408, 409, 425, 429, 503) or code > 504
+    raise SarvamError(f"Sarvam API {code}: {resp.text[:500]}", retryable, code)
 
 
 def fetch_recording(interaction_id: str, app_id: Optional[str] = None) -> Optional[bytes]:

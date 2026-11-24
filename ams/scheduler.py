@@ -18,10 +18,10 @@ import time
 from datetime import timedelta
 
 from .campaigns import (claim_row, due_row_ids, flag_stale, refresh_status, trigger_blocked, trigger_failed,
-                        trigger_succeeded)
+                        trigger_succeeded, trigger_uncertain)
 from .config import settings
 from .mailer import ensure_mail_cutoff, poll_inbox, send_due_emails
-from .results import poll_results
+from .results import last_ok_poll, poll_results, seen_attempts
 from .sarvam import SarvamError, place_call
 from .store import campaign_dir, campaign_tx, get_status, list_campaign_ids, set_status
 from .timeutil import fmt_local, iso, next_allowed_time, utcnow
@@ -54,7 +54,7 @@ def place_due_calls() -> dict:
             if camp["status"] in ("rejected", "completed"):
                 due = []
             else:
-                stats["stale"] += flag_stale(camp, now)
+                stats["stale"] += flag_stale(camp, now, last_ok_poll(), seen_attempts())
                 due = due_row_ids(camp, now)
                 allowed = next_allowed_time(now)
                 if due and allowed > now:  # outside calling hours: move to the next window
@@ -83,6 +83,11 @@ def place_due_calls() -> dict:
                     _pause_calls(str(exc))
                     stats["errors"] += 1
                     return stats
+                if exc.uncertain:  # Sarvam may have placed it: never dial again automatically
+                    trigger_uncertain(cid, row_id, att["ref"], str(exc))
+                    stats["errors"] += 1
+                    log.warning("%s %s call not confirmed by Sarvam: %s", cid, row_id, exc)
+                    continue
                 trigger_failed(cid, row_id, att["ref"], str(exc), exc.retryable)
                 stats["errors"] += 1
                 log.warning("%s %s not placed: %s", cid, row_id, exc)
@@ -98,7 +103,10 @@ def place_due_calls() -> dict:
 def run_cycle() -> dict:
     stats = place_due_calls()
     try:
-        stats["results"] = poll_results()["applied"]   # finished calls, fetched from Sarvam
+        fetched = poll_results()   # finished calls, fetched from Sarvam
+        stats["results"] = fetched["applied"]
+        if fetched.get("auth_error"):  # results can't be read: stop placing calls whose results we'd never see
+            _pause_calls("Sarvam refused reading call results: " + fetched["auth_error"])
     except Exception:
         log.exception("Fetching call results failed; retrying next cycle")
     stats["emails"] = send_due_emails()
