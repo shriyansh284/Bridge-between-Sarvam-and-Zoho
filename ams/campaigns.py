@@ -289,6 +289,29 @@ def flag_stale(camp: dict, now) -> int:
 
 
 # ---------------------------------------------------------------- results
+LATE_RESULT_HOURS = 24  # calls marked "under review" are still looked up this long, so a late result can rescue them
+
+
+def awaiting_attempts(now) -> list[dict]:
+    """Placed calls whose result hasn't arrived yet, in campaigns that are still open."""
+    out = []
+    for cid in list_campaign_ids():
+        if (campaign_dir(cid) / ".done").exists():
+            continue
+        camp = load_campaign(cid) or {}
+        if camp.get("status") == "rejected":
+            continue
+        for row in camp.get("rows", []):
+            for att in row["attempts"]:
+                if not att.get("sarvam_attempt_id"):
+                    continue
+                late = att["status"] == "no_result" and parse_iso(att["triggered_at"]) > now - timedelta(hours=LATE_RESULT_HOURS)
+                if att["status"] == "awaiting_result" or late:
+                    out.append({"campaign_id": cid, "row_id": row["row_id"], "ref": att["ref"],
+                                "sarvam_attempt_id": att["sarvam_attempt_id"], "triggered_at": att["triggered_at"]})
+    return out
+
+
 def normalize_payload(payload: dict) -> dict:
     raw = str(payload.get("status") or payload.get("connectivity_status") or "").lower()
     meta = (payload.get("webhook_config") or {}).get("metadata") or {}
@@ -298,6 +321,7 @@ def normalize_payload(payload: dict) -> dict:
         "app_id": payload.get("app_id"), "failure_reason": payload.get("failure_reason"),
         "variables": payload.get("final_agent_variables") or payload.get("output_agent_variables"),
         "transcript": payload.get("interaction_transcript"), "recording_url": payload.get("recording_url"),
+        "audio_url": payload.get("audio_url"),  # Sarvam's own (signed) recording link, from fetched results
         "campaign_id": meta.get("campaign_id"), "row_id": meta.get("row_id"), "ref": meta.get("ref"),
     }
 
@@ -332,7 +356,7 @@ def apply_result(payload: dict) -> str:
         att.update({
             "status": n["status"] or "failed", "result_at": iso(now), "duration": n["duration"],
             "interaction_id": n["interaction_id"], "app_id": n["app_id"], "variables": n["variables"],
-            "transcript": n["transcript"], "recording_url": n["recording_url"],
+            "transcript": n["transcript"], "recording_url": n["recording_url"], "audio_url": n["audio_url"],
             "failure_reason": n["failure_reason"] or (None if n["status"] else f"Unknown status '{n['raw_status']}'"),
         })
         if n["attempt_id"] and not att.get("sarvam_attempt_id"):

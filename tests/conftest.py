@@ -18,7 +18,7 @@ os.environ.update({
     "ZOHO_FROM_ADDRESS": "calling@ams.test", "ALLOWED_SENDERS": "@client.test",
     "PUBLIC_BASE_URL": "http://127.0.0.1:18000", "WEBHOOK_SECRET": "hook-secret",
     "CALL_WINDOW_START": "00:00", "CALL_WINDOW_END": "23:59",
-    "MAX_ATTEMPTS": "2", "RETRY_GAP_MINUTES": "0", "BACKGROUND_IN_SERVER": "false",
+    "MAX_ATTEMPTS": "2", "RETRY_GAP_MINUTES": "0", "BACKGROUND_IN_SERVER": "false", "RESULT_POLL_SECONDS": "0",
     "MOCK_RESULT": "digit", "MOCK_DELAY": "0.5",
 })
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

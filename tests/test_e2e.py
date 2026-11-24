@@ -314,6 +314,45 @@ def test_mail_already_in_the_inbox_at_go_live_is_never_processed():
         set_status("mail_cutoff", None)
 
 
+def test_no_public_address_results_are_fetched_from_sarvam():
+    """The production setup: no PUBLIC_BASE_URL, so Sarvam can't post results; the app fetches them."""
+    from ams.config import settings
+    from ams.store import get_status
+
+    original = settings.public_base_url
+    object.__setattr__(settings, "public_base_url", "")  # Settings is frozen; tests only
+    try:
+        data = _xlsx([["Q1", "Meera", "9876500070", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""],   # connects
+                      ["Q2", "Kabir", "9876500072", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""],   # busy twice
+                      ["Q3", "Isha", "9876500073", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]])   # fails
+        mid = _inject(data, "no_public_address.xlsx")
+        mailer.poll_inbox()
+        cid = next(c for c in list_campaign_ids() if (load_campaign(c).get("email") or {}).get("message_id") == mid)
+        _run_until(lambda: load_campaign(cid)["final_sent"], seconds=45)
+
+        sent = [b for b in mock_sarvam.CALLS if b["user_config"]["user_phone_number"] in
+                ("+919876500070", "+919876500072", "+919876500073")]
+        assert len(sent) == 4 and not any("webhook_config" in b for b in sent)  # nothing to post back to
+        rows = {r["candidate_id"]: r for r in load_campaign(cid)["rows"]}
+        meera = rows["Q1"]["attempts"][-1]
+        assert rows["Q1"]["status"] == "completed" and meera["variables"]["disposition_call_disposition"] == "agreed_to_submit"
+        assert meera["transcript"][0] == {"role": "agent", "text": "Hello, am I speaking with Meera?", "language": "English"}
+        assert meera["audio_url"].startswith("https://apps.sarvam.ai/api/analytics/public/")
+        assert rows["Q2"]["status"] == "not_reachable" and rows["Q2"]["attempt_count"] == 2
+        assert rows["Q3"]["status"] == "failed" and rows["Q3"]["note"] == "Call could not be placed"
+        assert get_status()["last_webhook"]["via"] == "poll" and get_status()["result_poll"]["ok"]
+
+        final = [m for m in _outbox() if m["in_reply_to"] == mid][-1]
+        wb = load_workbook(io.BytesIO(_attachment(final)))
+        header, got = _rows(wb["Candidates"])
+        assert got["Q1"]["Candidate Response"] == "Agreed to submit" and got["Q2"]["Call Status"] == "Busy"
+        assert "Agent: Hello, am I speaking with Meera?" in got["Q1"]["Transcript"]
+        link_cell = wb["Candidates"].cell(2, header.index("Recording Link") + 1)
+        assert link_cell.hyperlink.target == meera["audio_url"]  # Sarvam's signed link, not this server
+    finally:
+        object.__setattr__(settings, "public_base_url", original)
+
+
 def test_call_again_after_final_sends_a_new_final():
     from ams.campaigns import row_action
     cid = next(c for c in list_campaign_ids() if load_campaign(c)["final_sent"]

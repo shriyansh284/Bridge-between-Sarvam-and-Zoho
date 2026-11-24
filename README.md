@@ -1,12 +1,12 @@
 # AMS Email-to-Sarvam Calling Automation
 
-Clients email a candidate spreadsheet to one fixed Zoho Mail address. The system schedules a Sarvam AI call for every row at the row's Call Date and Call Time, collects each result from Sarvam's webhook, and replies in the same email thread with the client's own spreadsheet plus result columns. No database: everything is kept as files in `data/`.
+Clients email a candidate spreadsheet to one fixed Zoho Mail address. The system schedules a Sarvam AI call for every row at the row's Call Date and Call Time, fetches each call's result from Sarvam, and replies in the same email thread with the client's own spreadsheet plus result columns. No database: everything is kept as files in `data/`. No public address either: the server only makes outgoing connections.
 
 ```
 Client email + Excel ─► Zoho inbox ─► campaign (one per attachment)
                                         │  each row called at its Call Date + Call Time
                                         ▼
-                         Sarvam Instant Outbound call ─► result webhook
+                         Sarvam Instant Outbound call ─► result fetched from Sarvam (every minute)
                                         │
            reply in same thread ◄───────┘  "received" → update per finished time slot → FINAL file
 ```
@@ -15,7 +15,7 @@ Client email + Excel ─► Zoho inbox ─► campaign (one per attachment)
 
 They fill the predefined template, `templates/AMS_Calling_Template.csv` (or the Excel version `templates/AMS_Calling_Template.xlsx`, which has a "How to fill" sheet), and send it to the fixed address. Within a minute they get a reply confirming the campaign ID, how many calls were scheduled and from when to when, and which rows can't be called and why. Each time every call for one Call Date + Call Time finishes (including retries), they get an update reply with the whole spreadsheet as it stands. When the last call finishes they get the `_FINAL.xlsx` reply. Their columns, formatting and extra sheets come back unchanged, with these added on the right: Call Status, Call Date & Time, Call Duration, Attempt Count, Candidate Response, Commitment & Timeline, Call Summary, Call Quality, Other Agent Outputs, Remarks, Recording Link and Transcript. A "Call Summary" sheet is added at the end.
 
-The Recording Link is a signed link served by this app. It plays that one recording for 30 days (`RECORDING_LINK_DAYS`) with no login, and nobody ever sees your Sarvam account or API key.
+The Recording Link is Sarvam's own signed link to that one recording. It opens with no login for 14 days, as long as "Public signed URLs" is on in Sarvam (Settings → Workspace → Data policy; only the org Owner can change it). Nobody ever sees your Sarvam account or API key. (With an optional public address, `PUBLIC_BASE_URL`, links go through this app instead and last 30 days.)
 
 The template headers are flexible. The old cohort headers (`phone_number`, `name`, `Name_of_Hiring_company`, `pending_document_names`, `whatsapp_message_date`) also work, a title row above the table is fine, and the time can be one column (`20-11-2026 10:30`) or Call Date + Call Time (`20-11-2026` and `10:30 AM`). `NOW` calls as soon as the email arrives. A row with no time is called right away (`BLANK_TIME=now`) or rejected (`BLANK_TIME=reject`).
 
@@ -40,14 +40,15 @@ A file the system can't use gets a reply listing the problem, the attached CSV t
 ## Project layout
 
 ```
-ams/server.py      FastAPI: Sarvam webhook, recording links, health; runs the scheduler + inbox reader
-ams/scheduler.py   places due calls, flags lost results, queues and sends emails
+ams/server.py      FastAPI: health (+ optional webhook/recording links); runs the scheduler + inbox reader
+ams/results.py     fetches finished calls' results from Sarvam (no public address needed)
+ams/scheduler.py   places due calls, fetches results, flags lost ones, queues and sends emails
 ams/mailer.py      Zoho inbox → campaigns; ack / update / final / rejection replies
 ams/zoho.py        Zoho Mail API client (refresh-token OAuth)
 ams/campaigns.py   row states, retries, result handling, batch decisions
 ams/sheet.py       reads and validates the client's file
 ams/excel_out.py   builds the result workbook from the client's original file
-ams/sarvam.py      Sarvam Instant Outbound + recording download
+ams/sarvam.py      Sarvam: place a call, fetch results/transcripts, download recordings
 ams/store.py       file storage with locks (data/)
 ams/email_settings.py  mailbox / client / copy addresses the dashboard can change
 dashboard.py       internal Streamlit dashboard
@@ -99,9 +100,11 @@ Set `ALLOWED_SENDERS` to the client's addresses or domain (for example `@clientc
 
 Google Cloud credentials are not needed for this flow; Zoho handles all email.
 
-### Step 4: Public HTTPS address and secrets
+### Step 4: No public address needed
 
-Sarvam must reach `PUBLIC_BASE_URL/webhooks/sarvam/<WEBHOOK_SECRET>`, and the recording links point at `PUBLIC_BASE_URL/rec/...`. Generate both secrets with:
+Leave `PUBLIC_BASE_URL` empty. The server only makes outgoing connections: every `RESULT_POLL_SECONDS` (default 60) it asks Sarvam about the calls still waiting for a result, using the attempt ID Sarvam returned when each call was placed. The client's recording links are Sarvam's own signed links (see "What the client sees").
+
+Optional: if the server ever gets a public HTTPS address, set `PUBLIC_BASE_URL` and `WEBHOOK_SECRET`. Sarvam then also posts each result straight to `PUBLIC_BASE_URL/webhooks/sarvam/<WEBHOOK_SECRET>` (fetching keeps running as a safety net), and recording links go through `PUBLIC_BASE_URL/rec/...` (signed with `LINK_SECRET`). Generate secrets with:
 
 ```bash
 python -c "import secrets;print(secrets.token_urlsafe(32))"
@@ -132,7 +135,6 @@ SARVAM_OUTBOUND_BASE=http://127.0.0.1:9000/api/outbounds
 SARVAM_ANALYTICS_BASE=http://127.0.0.1:9000/api/analytics
 ZOHO_ACCOUNTS_URL=http://127.0.0.1:9100
 ZOHO_MAIL_API_URL=http://127.0.0.1:9100
-PUBLIC_BASE_URL=http://127.0.0.1:8000
 CALL_WINDOW_START=00:00
 CALL_WINDOW_END=23:59
 ```
@@ -152,14 +154,16 @@ python -m pytest -q
 
 ### Step 7: Deploy
 
+On an Ubuntu/Debian server, `sudo bash deploy/setup_server.sh` does everything below; see [DEVOPS_DEPLOYMENT.md](DEVOPS_DEPLOYMENT.md). The manual version:
+
 The backend must run continuously on one server with a persistent `data/` folder. The dashboard runs on the same server because it reads the same files. From the project folder, with the venv active, run these two processes:
 
 ```bash
-uvicorn ams.server:app --host 0.0.0.0 --port 8000 --workers 1
-streamlit run dashboard.py --server.port 8501 --server.headless true
+uvicorn ams.server:app --host 127.0.0.1 --port 8000 --workers 1
+streamlit run dashboard.py --server.address 127.0.0.1 --server.port 8501 --server.headless true
 ```
 
-Keep `--workers 1`: that one process runs the webhook, scheduler and inbox reader together. Both processes must survive logouts and reboots: use systemd on Linux, or on Windows a service manager such as NSSM or a Task Scheduler "at startup" task. Put HTTPS in front of port 8000 (nginx, Caddy or IIS) so Sarvam can reach `PUBLIC_BASE_URL`. Restrict the dashboard to your team, for example with a VPN, an IP allow-list or the reverse proxy's basic auth, in addition to its own login.
+Keep `--workers 1`: that one process runs the inbox reader, call scheduler, result fetcher and email sender together. Both processes must survive logouts and reboots: use systemd on Linux, or on Windows a service manager such as NSSM or a Task Scheduler "at startup" task. Nothing needs to be reachable from the internet. Reach the dashboard through an SSH tunnel (`ssh -L 8501:127.0.0.1:8501 <user>@<server>`), in addition to its own login.
 
 ### Step 8: First live check
 
@@ -181,7 +185,7 @@ Before giving the address to the client, email yourself a one-row file with your
 
 ## The dashboard
 
-The Campaigns tab shows whether the scheduler, inbox and webhooks are alive, totals across campaigns, and every campaign with progress. Select a campaign to see each candidate's status. From there you can play recordings and read transcripts, download the original or current results, email an update immediately, cancel waiting calls, call one candidate now or again, and resend the last email. The New campaign tab creates a campaign from an uploaded file (with or without an email address for results). The Inbox log shows every email the system saw and what it did with it.
+The Campaigns tab shows whether the scheduler, inbox and call results are working, totals across campaigns, and every campaign with progress. Select a campaign to see each candidate's status. From there you can play recordings and read transcripts, download the original or current results, email an update immediately, cancel waiting calls, call one candidate now or again, and resend the last email. The New campaign tab creates a campaign from an uploaded file (with or without an email address for results). The Inbox log shows every email the system saw and what it did with it.
 
 **Changing email addresses.** When your address or the client's is replaced, use the Email settings tab; no `.env` edit or restart is needed, and every change is logged with who made it.
 - *AMS mailbox* is the fixed address clients send files to, and the From address of every reply. It is checked against Zoho before saving. It must be the mailbox the Zoho refresh token belongs to, or an alias of it; moving to a mailbox under a different Zoho login needs a new `ZOHO_REFRESH_TOKEN` (Step 3).
@@ -197,7 +201,7 @@ data/campaigns/AMS-20261120-001/campaign.json    every row, attempt, result and 
 data/campaigns/AMS-20261120-001/input.xlsx       the client's original attachment
 data/campaigns/AMS-20261120-001/outputs/         every result file that was emailed
 data/state/mail_log.jsonl                        inbox activity
-data/state/webhooks.jsonl                        every raw Sarvam result (audit)
+data/state/webhooks.jsonl                        every raw Sarvam result, fetched or posted (audit)
 data/state/processed_messages.json               emails already handled (and ones waiting for an allowed sender)
 data/state/email_settings.json                   addresses changed in the dashboard (override .env)
 data/state/settings_log.jsonl                    who changed which address, and when
@@ -207,6 +211,5 @@ Back up `data/` regularly; it is the only state. Old campaign folders can be arc
 
 ## Troubleshooting
 
-When the inbox shows an error, run `python -m ams.zoho_setup check`. "Token refresh failed" usually means the wrong `ZOHO_DC`, or a refresh token created for another account. When no calls go out, check the System panel at the top of the Campaigns tab for missing Sarvam settings or a stopped scheduler, and confirm the current time is inside the calling window. When results never arrive, confirm `PUBLIC_BASE_URL` is reachable from the internet over HTTPS and that `/health` responds. Rows then show "Result pending (under review)" after `RESULT_TIMEOUT_MINUTES`.
-#   B r i d g e - b e t w e e n - S a r v a m - a n d - Z o h o  
- 
+When the inbox shows an error, run `python -m ams.zoho_setup check`. "Token refresh failed" usually means the wrong `ZOHO_DC`, or a refresh token created for another account. When no calls go out, check the System panel at the top of the Campaigns tab for missing Sarvam settings or a stopped scheduler, and confirm the current time is inside the calling window. When results never arrive, the dashboard shows a red "Couldn't fetch call results" message with Sarvam's error; `python -m ams.sarvam_setup check` confirms the key and IDs. A call whose result never appears in Sarvam shows "Result pending (under review)" after `RESULT_TIMEOUT_MINUTES`; a result that turns up later (within 24 hours) still updates the row while the campaign is open.
+# Bridge-between-Sarvam-and-Zoho

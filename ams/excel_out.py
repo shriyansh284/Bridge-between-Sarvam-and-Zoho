@@ -84,8 +84,10 @@ def result_values(camp: dict, row: dict) -> dict:
         remark = f"Call scheduled for {fmt_local(row['next_call_at'])}" + (f" ({remark})" if remark and "retrying" not in remark else "")
     values["Remarks"] = remark
     link = ""
-    if connected and (connected.get("interaction_id") or connected.get("recording_url")):
-        link = recording_link(camp["campaign_id"], row["row_id"], connected["ref"])
+    if connected and settings.public_base_url and (connected.get("interaction_id") or connected.get("recording_url")):
+        link = recording_link(camp["campaign_id"], row["row_id"], connected["ref"])  # through this server, 30 days
+    elif connected:
+        link = connected.get("audio_url") or ""  # Sarvam's own signed link (no public address needed), 14 days
     values["Recording Link"] = link
     values["Transcript"] = transcript_text((connected or {}).get("transcript"))
     return values

@@ -9,18 +9,22 @@ Then in .env:
     SARVAM_ANALYTICS_BASE=http://localhost:9000/api/analytics
     PUBLIC_WEBHOOK_BASE_URL=http://localhost:8000
 
-Each "call" reports back after MOCK_DELAY seconds with a random result
+Each "call" finishes after MOCK_DELAY seconds with a random result
 (answered / no answer / busy / failed). Set MOCK_RESULT=connected to force one,
 or MOCK_RESULT=digit to decide by the phone's last digit (1 no answer, 2 busy, 3 failed).
+The result is posted to the webhook when the call asked for one, and is always visible
+through Analytics "List attempts" + "Get transcript", like the real API.
 """
 import asyncio
 import io
+import json
 import math
 import os
 import random
 import struct
 import uuid
 import wave
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -30,6 +34,8 @@ DELAY = float(os.environ.get("MOCK_DELAY", "3"))
 FORCED = os.environ.get("MOCK_RESULT", "")
 WEIGHTS = {"connected": 60, "no_answer": 25, "busy": 10, "failed": 5}
 _tasks: set = set()
+ATTEMPTS: dict[str, dict] = {}  # Analytics "List attempts" records, keyed by attempt_id
+CALLS: list[dict] = []          # every outbound request body received (for tests)
 
 
 def _payload(attempt_id: str, body: dict, status: str) -> dict:
@@ -63,6 +69,26 @@ def _payload(attempt_id: str, body: dict, status: str) -> dict:
     }
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0).isoformat()
+
+
+def _analytics_record(payload: dict) -> dict:
+    """The same result as Analytics 'List attempts' shows it (real field names and values)."""
+    connected = payload["status"] == "connected"
+    return {
+        "attempt_id": payload["attempt_id"], "interaction_id": payload["interaction_id"],
+        "connectivity_status": payload["status"], "failure_reason": "NO_FAILURE_REASON",
+        "duration_in_seconds": payload["duration"] or 0, "attempted_at": ATTEMPTS[payload["attempt_id"]]["attempted_at"],
+        "start_datetime": _now() if connected else None, "end_datetime": _now() if connected else None,
+        "channel_direction": "outbound", "server_retry_attempt": 1, "app_version": payload["app_version"],
+        "agent_variables": payload["final_agent_variables"],
+        "audio_url": f"https://apps.sarvam.ai/api/analytics/public/v1/mock/{payload['interaction_id']}?sig=mock"
+        if connected else None,
+        "_transcript": payload["interaction_transcript"],
+    }
+
+
 async def _report(attempt_id: str, body: dict):
     await asyncio.sleep(DELAY)
     if FORCED == "digit":  # deterministic by last digit of the number: 1 no answer, 2 busy, 3 failed
@@ -70,10 +96,12 @@ async def _report(attempt_id: str, body: dict):
         status = {"1": "no_answer", "2": "busy", "3": "failed"}.get(last, "connected")
     else:
         status = FORCED or random.choices(list(WEIGHTS), weights=list(WEIGHTS.values()))[0]
-    url = (body.get("webhook_config") or {}).get("url")
+    payload = _payload(attempt_id, body, status)
+    ATTEMPTS[attempt_id] = _analytics_record(payload)
+    url = (body.get("webhook_config") or {}).get("url")  # only sent when the app has a public address
     if url:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json=_payload(attempt_id, body, status))
+            await client.post(url, json=payload)
 
 
 @app.post("/api/outbounds/v1/orgs/{org}/workspaces/{ws}/outbounds")
@@ -81,11 +109,40 @@ async def outbound(org: str, ws: str, request: Request):
     if not request.headers.get("x-api-key"):
         return Response(status_code=401)
     body = await request.json()
+    CALLS.append(body)
     attempt_id = str(uuid.uuid4())
+    # While the call is ringing / in progress, Analytics shows it without a final status
+    ATTEMPTS[attempt_id] = {"attempt_id": attempt_id, "connectivity_status": None, "attempted_at": _now(),
+                            "end_datetime": None, "failure_reason": "NO_FAILURE_REASON", "server_retry_attempt": 1}
     task = asyncio.create_task(_report(attempt_id, body))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
     return {"attempt_id": attempt_id}
+
+
+@app.get("/api/analytics/v1/{org}/{ws}/{app_id}/attempts")
+async def attempts(org: str, ws: str, app_id: str, request: Request):
+    if not request.headers.get("x-api-key"):
+        return Response(status_code=401)
+    q = request.query_params
+    if not (q.get("start_datetime") and q.get("end_datetime")):
+        return Response(status_code=422)
+    wanted = {c["value"] for c in json.loads(q.get("filter_conditions") or "[]")
+              if c.get("field") == "attempt_id" and c.get("operator") == "equals"}
+    items = [{k: v for k, v in rec.items() if not k.startswith("_")}
+             for aid, rec in ATTEMPTS.items() if not wanted or aid in wanted]
+    offset, limit = int(q.get("offset", 0)), int(q.get("limit", 20))
+    return {"items": items[offset:offset + limit], "total": len(items), "limit": limit, "offset": offset,
+            "next_page_uri": "", "prev_page_uri": ""}
+
+
+@app.get("/api/analytics/v1/{org}/{ws}/{app_id}/transcripts/{interaction_id:path}")
+async def transcript(org: str, ws: str, app_id: str, interaction_id: str):
+    rec = next((r for r in ATTEMPTS.values() if r.get("interaction_id") == interaction_id), None)
+    turns = (rec or {}).get("_transcript") or []
+    return {"interaction_id": interaction_id,  # real API: role is "assistant" or "user", text in "content"
+            "messages": [{"turn_id": i + 1, "role": "assistant" if t["role"] == "agent" else "user",
+                          "content": t["en_text"], "language_name": "English"} for i, t in enumerate(turns)]}
 
 
 @app.get("/api/analytics/v1/{org}/{ws}/{app_id}/recordings/{interaction_id:path}")

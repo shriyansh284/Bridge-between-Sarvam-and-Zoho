@@ -1,23 +1,32 @@
 """
-Thin client for the two Sarvam endpoints this system needs.
+Thin client for the Sarvam endpoints this system needs. All calls go OUT from this
+server, so no public address is needed (results are fetched, not received).
 
 1. Instant Outbound  - place one call now, with per-candidate agent variables
    POST {outbound_base}/v1/orgs/{org}/workspaces/{ws}/outbounds
-2. Analytics recording - download the WAV for an interaction, server-side
+2. Analytics attempts - the result of our calls, looked up by attempt_id
+   GET  {analytics_base}/v1/{org}/{ws}/{app_id}/attempts
+3. Analytics transcript - what was said in a connected call
+   GET  {analytics_base}/v1/{org}/{ws}/{app_id}/transcripts/{interaction_id}
+4. Analytics recording - download the WAV for an interaction, server-side (dashboard)
    GET  {analytics_base}/v1/{org}/{ws}/{app_id}/recordings/{interaction_id}
 
-Both use the workspace API key (X-API-Key). Your dashboard email/password is
-never used anywhere.
+All use the workspace API key (X-API-Key). Your dashboard email/password is
+never used anywhere. If PUBLIC_BASE_URL is set, Sarvam is also asked to post each
+result to our webhook (faster); the fetch above still runs as a safety net.
 """
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import quote, urlparse
 
 import requests
 
 from .config import settings
+from .timeutil import utcnow
 
 log = logging.getLogger(__name__)
 TIMEOUT = 30
@@ -43,6 +52,11 @@ def format_phone_for_sarvam(e164: str) -> str:
     return e164
 
 
+def webhooks_enabled() -> bool:
+    """Only when this server has a public address can Sarvam post results to it."""
+    return bool(settings.public_base_url and settings.webhook_secret)
+
+
 def build_outbound_payload(phone_e164: str, agent_variables: dict, app_overrides: Optional[dict],
                            metadata: dict) -> dict:
     app_config: dict = {
@@ -57,11 +71,60 @@ def build_outbound_payload(phone_e164: str, agent_variables: dict, app_overrides
     overrides = {k: v for k, v in (app_overrides or {}).items() if v}
     if overrides:
         app_config["app_overrides"] = overrides
-    return {
+    payload = {
         "app_config": app_config,
         "user_config": {"user_phone_number": format_phone_for_sarvam(phone_e164)},
-        "webhook_config": {"url": settings.webhook_url, "metadata": metadata},
     }
+    if webhooks_enabled():
+        payload["webhook_config"] = {"url": settings.webhook_url, "metadata": metadata}
+    return payload
+
+
+def _analytics_url(path: str) -> str:
+    return (f"{settings.sarvam_analytics_base.rstrip('/')}/v1/{settings.sarvam_org_id}/"
+            f"{settings.sarvam_workspace_id}/{settings.sarvam_app_id}/{path}")
+
+
+def _analytics_get(path: str, params: Optional[dict] = None, timeout: int = TIMEOUT) -> dict:
+    try:
+        resp = requests.get(_analytics_url(path), headers=_headers(), params=params, timeout=timeout)
+    except requests.RequestException as exc:
+        raise SarvamError(f"Network error reaching Sarvam: {exc}", retryable=True) from exc
+    if resp.status_code >= 400:
+        raise SarvamError(f"Sarvam API {resp.status_code}: {resp.text[:300]}",
+                          resp.status_code in (408, 429) or resp.status_code >= 500, resp.status_code)
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise SarvamError(f"Unexpected Sarvam response: {resp.text[:300]}", retryable=True) from exc
+
+
+def fetch_attempts(attempt_ids: list[str], since: datetime, batch: int = 50) -> list[dict]:
+    """Analytics records for our own calls, found by the attempt_id Sarvam returned when each call
+    was placed. `since` (naive UTC) bounds the search; a call can show up a few minutes after it ends."""
+    end = (utcnow() + timedelta(minutes=10)).isoformat()
+    found: list[dict] = []
+    for i in range(0, len(attempt_ids), batch):
+        conditions = [{"field": "attempt_id", "operator": "equals", "value": str(a)} for a in attempt_ids[i:i + batch]]
+        offset = 0
+        while True:
+            data = _analytics_get("attempts", {
+                "start_datetime": since.isoformat(), "end_datetime": end, "limit": 1000, "offset": offset,
+                "filter_conditions": json.dumps(conditions)})
+            items = data.get("items") or []
+            found.extend(items)
+            if len(items) < 1000 or offset >= 9000:
+                break
+            offset += 1000
+    return found
+
+
+def fetch_transcript(interaction_id: str) -> list[dict]:
+    """[{role: agent|user, text}] for one conversation; [] when Sarvam has none."""
+    data = _analytics_get(f"transcripts/{quote(interaction_id, safe='')}")
+    turns = sorted(data.get("messages") or [], key=lambda m: m.get("turn_id") or 0)
+    return [{"role": "agent" if str(m.get("role", "")).lower() in ("assistant", "agent") else "user",
+             "text": m.get("content") or "", "language": m.get("language_name")} for m in turns]
 
 
 def place_call(phone_e164: str, agent_variables: dict, app_overrides: Optional[dict], metadata: dict) -> str:

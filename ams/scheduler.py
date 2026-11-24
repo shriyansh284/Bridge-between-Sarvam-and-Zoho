@@ -4,7 +4,8 @@ Background work. Runs inside server.py by default, or on its own:
     python -m ams.scheduler          # loop forever
     python -m ams.scheduler --once   # one pass (testing)
 
-Every SCHEDULER_POLL_SECONDS: flag lost results, place due calls, send due emails.
+Every SCHEDULER_POLL_SECONDS: flag lost results, place due calls, fetch finished calls'
+results from Sarvam (at most every RESULT_POLL_SECONDS), send due emails.
 Every MAIL_POLL_SECONDS: read new emails from the Zoho inbox.
 """
 from __future__ import annotations
@@ -20,6 +21,7 @@ from .campaigns import (claim_row, due_row_ids, flag_stale, refresh_status, trig
                         trigger_succeeded)
 from .config import settings
 from .mailer import ensure_mail_cutoff, poll_inbox, send_due_emails
+from .results import poll_results
 from .sarvam import SarvamError, place_call
 from .store import campaign_dir, campaign_tx, get_status, list_campaign_ids, set_status
 from .timeutil import fmt_local, iso, next_allowed_time, utcnow
@@ -95,6 +97,10 @@ def place_due_calls() -> dict:
 
 def run_cycle() -> dict:
     stats = place_due_calls()
+    try:
+        stats["results"] = poll_results()["applied"]   # finished calls, fetched from Sarvam
+    except Exception:
+        log.exception("Fetching call results failed; retrying next cycle")
     stats["emails"] = send_due_emails()
     set_status("scheduler_heartbeat", iso(utcnow()))
     return stats

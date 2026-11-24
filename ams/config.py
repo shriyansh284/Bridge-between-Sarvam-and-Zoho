@@ -107,7 +107,10 @@ class Settings:
     send_ack: bool = _bool("SEND_ACK", True)
     duplicate_file_days: int = _int("DUPLICATE_FILE_DAYS", 7)
 
-    # --- Public URLs ----------------------------------------------------
+    # --- Public URLs (OPTIONAL) -----------------------------------------
+    # Without a public address the app fetches each call's result from Sarvam every RESULT_POLL_SECONDS,
+    # and recording links in the Excel point at Sarvam's own signed links. With one, Sarvam also posts
+    # results to our webhook straight away and recording links go through this server.
     public_base_url: str = _get("PUBLIC_BASE_URL", "")          # where server.py is reachable over HTTPS
     webhook_secret: str = _get("WEBHOOK_SECRET", "")
     link_secret: str = _get("LINK_SECRET", "") or _get("WEBHOOK_SECRET", "")
@@ -127,6 +130,7 @@ class Settings:
     max_trigger_errors: int = _int("MAX_TRIGGER_ERRORS", 3)
     trigger_error_backoff_minutes: int = _int("TRIGGER_ERROR_BACKOFF_MINUTES", 5)
     result_timeout_minutes: int = _int("RESULT_TIMEOUT_MINUTES", 45)
+    result_poll_seconds: int = _int("RESULT_POLL_SECONDS", 60)   # how often finished calls are fetched from Sarvam
     max_calls_per_cycle: int = _int("MAX_CALLS_PER_CYCLE", 5)
     scheduler_poll_seconds: int = _int("SCHEDULER_POLL_SECONDS", 20)
     past_time_grace_hours: int = _int("PAST_TIME_GRACE_HOURS", 24)
@@ -158,8 +162,7 @@ class Settings:
             "SARVAM_WORKSPACE_ID": self.sarvam_workspace_id, "SARVAM_APP_ID": self.sarvam_app_id,
             "SARVAM_CONNECTION_ID": self.sarvam_connection_id,
             "SARVAM_AGENT_PHONE_NUMBER": self.sarvam_agent_phone_number,
-            "PUBLIC_BASE_URL": self.public_base_url, "WEBHOOK_SECRET": self.webhook_secret,
-        }
+        }  # PUBLIC_BASE_URL is optional: results are fetched from Sarvam when there is none
         return [k for k, v in need.items() if not v]
 
     def missing_for_mail(self) -> list[str]:

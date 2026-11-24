@@ -4,9 +4,12 @@ The always-on backend.
     uvicorn ams.server:app --host 0.0.0.0 --port 8000      (run with ONE worker)
 
 Routes
-  POST /webhooks/sarvam/{WEBHOOK_SECRET}   Sarvam posts each call result here
-  GET  /rec/{token}                        signed recording link used in the result Excel
+  POST /webhooks/sarvam/{WEBHOOK_SECRET}   Sarvam posts each call result here (only with a public address)
+  GET  /rec/{token}                        signed recording link used in the result Excel (only with a public address)
   GET  /health                             status for monitoring
+
+No public address is needed: without one, results are fetched from Sarvam (ams/results.py) and
+recording links in the Excel are Sarvam's own signed links. Bind to 127.0.0.1 in that case.
 
 It also runs the scheduler and the inbox reader in background threads
 (set BACKGROUND_IN_SERVER=false to run `python -m ams.scheduler` separately).
@@ -21,13 +24,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 
-from .campaigns import apply_result
 from .config import settings
 from .links import read_token
+from .results import process_result
 from .sarvam import fetch_recording, fetch_recording_url
 from .scheduler import Background
-from .store import append_log, get_status, load_campaign, set_status
-from .timeutil import iso, utcnow
+from .store import get_status, load_campaign
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("server")
@@ -48,15 +50,7 @@ app = FastAPI(title="AMS calling automation", lifespan=lifespan, docs_url=None, 
 
 
 def _process(payload: dict) -> str:
-    append_log("webhooks", {"payload": payload})  # raw copy first, for audit and replay
-    try:
-        outcome = apply_result(payload)
-    except Exception as exc:
-        log.exception("Webhook processing failed")
-        append_log("webhook_errors", {"payload": payload, "error": repr(exc)[:1000]})
-        return "error"
-    set_status("last_webhook", {"at": iso(utcnow()), "outcome": outcome})
-    return outcome
+    return process_result(payload, "webhook")
 
 
 @app.post("/webhooks/sarvam/{token}")
@@ -107,4 +101,5 @@ async def recording(token: str):
 async def health():
     status = get_status()
     return {"ok": True, "scheduler_heartbeat": status.get("scheduler_heartbeat"),
-            "mail_last_check": status.get("mail_last_check"), "last_webhook": status.get("last_webhook")}
+            "mail_last_check": status.get("mail_last_check"), "last_webhook": status.get("last_webhook"),
+            "result_poll": status.get("result_poll"), "calls_paused": status.get("calls_paused")}

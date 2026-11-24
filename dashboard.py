@@ -81,6 +81,10 @@ def system_panel() -> None:
         st.error("The backend isn't running, so no calls or emails go out. Start: uvicorn ams.server:app")
     if mail and not mail.get("ok"):
         st.error(f"Zoho Mail error: {mail.get('error')}")
+    poll = status.get("result_poll") or {}
+    if poll and not poll.get("ok"):
+        st.error(f"Couldn't fetch call results from Sarvam at {fmt_local(poll['at'])}: {poll.get('error')}. "
+                 "It retries automatically every minute.")
     if paused := status.get("calls_paused"):
         st.error(f"Calls are paused since {fmt_local(paused['at'])}: {paused['reason']}. Waiting calls are kept, "
                  "not failed. Fix the Sarvam values in .env (python -m ams.sarvam_setup check) and restart the backend.")
@@ -261,7 +265,7 @@ def row_detail(camp: dict, row: dict) -> None:
                 for turn in att.get("transcript") or []:
                     agent = str(turn.get("role", "")).lower() in ("agent", "assistant", "bot")
                     with st.chat_message("assistant" if agent else "user"):
-                        st.write(turn.get("indic_text") or turn.get("en_text") or "")
+                        st.write(turn.get("indic_text") or turn.get("en_text") or turn.get("text") or "")
                         if turn.get("indic_text") and turn.get("en_text"):
                             st.caption(turn["en_text"])
 
