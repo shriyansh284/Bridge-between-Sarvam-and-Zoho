@@ -257,6 +257,7 @@ Status    : curl -s http://127.0.0.1:8000/health
 Logs      : journalctl -u ams-backend -f        (dashboard: -u ams-dashboard)
 Update    : download this script again and run it:  sudo bash setup_server.sh
 Backups   : /var/backups/ams-calling (daily, kept 14 days)
+Client SFTP folder (optional): sudo CLIENT_IPS=<client IP> bash setup_sftp.sh  (see DEVOPS_DEPLOYMENT.md)
 
 $ONE_COPY
 EOF

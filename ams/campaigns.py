@@ -107,15 +107,65 @@ def find_duplicate_file(sha: str, sender: str) -> Optional[str]:
     for cid in list_campaign_ids():
         camp = load_campaign(cid) or {}
         original = camp["original_sender"] if "original_sender" in camp else camp.get("reply_to")
-        if (camp.get("file_sha256") == sha and (original or "").lower() == (sender or "").lower()
+        same_client = (original or "").lower() == (sender or "").lower() or camp.get("drop")  # or sent by SFTP
+        if (camp.get("file_sha256") == sha and same_client
                 and camp.get("status") != "rejected" and parse_iso(camp["created_at"]) >= cutoff):
             return cid
     return None
 
 
+def find_drop_campaign(claim_id: str) -> Optional[str]:
+    """The campaign already created from this SFTP upload (crash-safe: never create it twice)."""
+    for cid in list_campaign_ids():
+        if ((load_campaign(cid) or {}).get("drop") or {}).get("claim_id") == claim_id:
+            return cid
+    return None
+
+
+def find_duplicate_drop(sha: str) -> Optional[str]:
+    """The same file received within DUPLICATE_FILE_DAYS, over SFTP or by email (its candidates were
+    already called)."""
+    cutoff = utcnow() - timedelta(days=settings.duplicate_file_days)
+    for cid in list_campaign_ids():
+        camp = load_campaign(cid) or {}
+        if (camp.get("source") in ("sftp", "email") and camp.get("file_sha256") == sha and camp.get("status") != "rejected"
+                and parse_iso(camp["created_at"]) >= cutoff):
+            return cid
+    return None
+
+
+def _skip_already_booked(rows: list[dict]) -> None:
+    """A client's system that sends files at any time can send the same record again (overlapping exports).
+    A row whose phone number already has a call at the same date and time in another recent campaign is not
+    called again; the results file says which campaign has it. (NOW rows have no time to compare.)"""
+    wanted = {(r["phone"], r["slot"]): r for r in rows if r["status"] != "invalid" and r["slot"] != "Immediate"}
+    if not wanted:
+        return
+    cutoff = utcnow() - timedelta(days=settings.duplicate_file_days)
+    for cid in list_campaign_ids():  # the new campaign isn't saved yet, so it isn't listed
+        camp = load_campaign(cid) or {}
+        if camp.get("status") == "rejected" or parse_iso(camp["created_at"]) < cutoff:
+            continue
+        for old in camp.get("rows", []):
+            if old["status"] in ("invalid", "cancelled"):
+                continue
+            row = wanted.pop((old["phone"], old["slot"]), None)
+            if row:
+                reason = f"Already in campaign {cid} (row {old['excel_row']}) for the same call time; not called again"
+                row.update(status="invalid", errors=row["errors"] + [reason], note=reason)
+        if not wanted:
+            return
+
+
+def delivers(camp: dict) -> bool:
+    """Whether results go anywhere by themselves: an email address, or the client's SFTP folder."""
+    return bool(camp.get("reply_to") or camp.get("drop"))
+
+
 def create_campaign(data: bytes, filename: str, source: str, reply_to: Optional[str] = None,
-                    email: Optional[dict] = None, created_by: str = "") -> dict:
-    """Validate the file and create the campaign. Raises SheetError when the file is unusable."""
+                    email: Optional[dict] = None, created_by: str = "", drop: Optional[dict] = None) -> dict:
+    """Validate the file and create the campaign. Raises SheetError when the file is unusable.
+    `drop`: the file came through the SFTP folder, so results are written there instead of emailed."""
     sheet = read_sheet(data, filename)
     missing = missing_columns(sheet)
     if missing:
@@ -123,11 +173,13 @@ def create_campaign(data: bytes, filename: str, source: str, reply_to: Optional[
     if not sheet.rows:
         raise SheetError("The sheet has a header but no candidate rows.")
 
-    checks = validate(sheet)
+    # Email and dashboard files use the template (day first); the client's own system may write month first
+    checks = validate(sheet, date_order=settings.drop_date_order if drop else "dmy")
     cid = new_campaign_id()
     ext = Path(filename).suffix.lower() or ".xlsx"
     (campaign_dir(cid) / f"input{ext}").write_bytes(data)
     rows = [_row_from_check(chk, i + 1) for i, chk in enumerate(checks)]
+    _skip_already_booked(rows)
     valid = [r for r in rows if r["status"] != "invalid"]
     camp = {
         "campaign_id": cid,
@@ -136,6 +188,7 @@ def create_campaign(data: bytes, filename: str, source: str, reply_to: Optional[
         "created_by": created_by,
         "email": email,
         "reply_to": reply_to,
+        "drop": drop,
         "file_name": filename,
         "input_file": f"input{ext}",
         "file_sha256": file_sha(data),
@@ -150,7 +203,7 @@ def create_campaign(data: bytes, filename: str, source: str, reply_to: Optional[
         "last_update_done": 0,
         "final_sent": False,
     }
-    if reply_to and settings.send_ack:
+    if (reply_to and settings.send_ack) or drop:  # over SFTP the "received" file is the only confirmation
         queue_email(camp, "rejected" if not valid else "ack", "ack")
     save_campaign(camp)
     log.info("Created %s from %s: %s rows, %s valid", cid, filename, len(rows), len(valid))
@@ -430,8 +483,8 @@ def queue_email(camp: dict, kind: str, key: str, info: Optional[dict] = None) ->
 
 
 def decide_emails(camp: dict) -> None:
-    """Inside a campaign_tx: queue the next update / final email if one is due."""
-    if not camp.get("reply_to") or camp["status"] == "rejected" or camp.get("final_sent"):
+    """Inside a campaign_tx: queue the next update / final email (or SFTP result file) if one is due."""
+    if not delivers(camp) or camp["status"] == "rejected" or camp.get("final_sent"):
         return
     if any(e["kind"] == "final" and e["status"] in ("pending", "sending", "failed") for e in camp["emails"]):
         return  # a final email is already on its way (or needs a manual resend)
@@ -514,6 +567,8 @@ def change_recipient(cid: str, address: str, user: str = "") -> str:
     if not EMAIL_RE.match(address):
         return f"'{address}' isn't a valid email address."
     with campaign_tx(cid) as camp:
+        if camp.get("drop"):
+            return f"{cid} came through the SFTP folder; its results are written there, not emailed."
         old = camp.get("reply_to")
         if old == address:
             return f"Results for {cid} already go to {address}."
@@ -539,11 +594,13 @@ def campaign_action(cid: str, action: str) -> str:
             refresh_status(camp)
             return f"Cancelled {n} waiting call(s). Calls already in progress will still report back."
         if action == "send_update":
-            if not camp.get("reply_to"):
+            if not delivers(camp):
                 return "This campaign has no email address to send to. Download the file instead."
             n = sum(1 for e in camp["emails"] if e["kind"] == "update") + 1
             queue_email(camp, "update", f"update-{n}", {"update_no": n, "manual": True})
             (campaign_dir(cid) / ".done").unlink(missing_ok=True)
+            if camp.get("drop"):
+                return "The current results will be written to the client's SFTP results folder within a minute."
             return "An update with the current results will be emailed within a minute."
         if action == "resend_last":
             if not camp["emails"]:

@@ -5,6 +5,8 @@ poll_inbox():   unread emails with attachments in the fixed Zoho address ->
                 each spreadsheet attachment becomes one campaign.
 send_due_emails(): sends queued ack / update / final / rejection replies in
                 the client's original thread, with the result Excel attached.
+                For a file that came through the SFTP folder (ams/dropfolder.py)
+                the same results are written there as files instead.
 """
 from __future__ import annotations
 
@@ -17,9 +19,10 @@ from typing import Optional
 from filelock import Timeout
 
 from . import email_settings
-from .campaigns import counts, create_campaign, decide_emails, file_sha, find_campaign, find_duplicate_file, \
-    next_call_time, slot_label
+from .campaigns import counts, create_campaign, decide_emails, delivers, file_sha, find_campaign, \
+    find_duplicate_file, next_call_time, slot_label
 from .config import BASE_DIR, settings
+from .dropfolder import deliver as deliver_to_drop
 from .excel_out import build_results, output_name
 from .sheet import CLIENT_FORMAT, SheetError
 from .store import (STATE, append_log, campaign_dir, campaign_tx, get_status, list_campaign_ids, load_campaign, lock,
@@ -329,12 +332,42 @@ def _campaign_closed(camp: dict) -> bool:
         return False
     if camp["status"] == "rejected":
         return True
-    return camp["status"] == "completed" and (camp.get("final_sent") or not camp.get("reply_to"))
+    return camp["status"] == "completed" and (camp.get("final_sent") or not delivers(camp))
 
 
 def _send_one(cid: str, index: int) -> int:
+    """Send one queued result: by email, or for a file that came through the SFTP folder, as a file there."""
     camp = load_campaign(cid)
     rec = camp["emails"][index]
+    ok, error, saved, saved_only = False, None, None, False
+    try:
+        if camp.get("drop"):
+            saved = deliver_to_drop(camp, rec)
+            ok = True
+        else:
+            saved, ok, saved_only, error = _email_one(camp, rec)
+    except Exception as exc:  # keep the loop alive; retried next cycle
+        log.exception("Writing the %s file for %s to the SFTP folder failed", rec["kind"], cid)
+        error = str(exc)[:500]
+    with campaign_tx(cid) as camp:
+        rec = camp["emails"][index]
+        rec["file"] = saved or rec.get("file")
+        if camp.get("drop"):
+            rec["via"] = "sftp"
+        if ok or saved_only:
+            rec.update(status="sent" if ok else "saved", sent_at=iso(utcnow()), error=None)
+            # A final composed before the campaign was reopened ("Call again", a late result) is out of date:
+            # it doesn't finish the campaign, so the corrected final still follows.
+            if rec["kind"] == "final" and (rec.get("sending_at") or "") > (camp.get("reopened_at") or ""):
+                camp["final_sent"] = True
+        else:
+            rec.update(status="failed", failures=rec["failures"] + 1, error=error)
+    return int(ok)
+
+
+def _email_one(camp: dict, rec: dict) -> tuple[Optional[str], bool, bool, Optional[str]]:
+    """(saved file, sent, saved only, error) for one queued email."""
+    cid = camp["campaign_id"]
     ok, error, saved, saved_only = False, None, None, False
     try:
         subject, body, attach = compose(camp, rec)
@@ -353,15 +386,4 @@ def _send_one(cid: str, index: int) -> int:
     except Exception as exc:  # keep the loop alive; retried next cycle
         log.exception("Sending %s email for %s failed", rec["kind"], cid)
         error = str(exc)[:500]
-    with campaign_tx(cid) as camp:
-        rec = camp["emails"][index]
-        rec["file"] = saved or rec.get("file")
-        if ok or saved_only:
-            rec.update(status="sent" if ok else "saved", sent_at=iso(utcnow()), error=None)
-            # A final composed before the campaign was reopened ("Call again", a late result) is out of date:
-            # it doesn't finish the campaign, so the corrected final still follows.
-            if rec["kind"] == "final" and (rec.get("sending_at") or "") > (camp.get("reopened_at") or ""):
-                camp["final_sent"] = True
-        else:
-            rec.update(status="failed", failures=rec["failures"] + 1, error=error)
-    return int(ok)
+    return saved, ok, saved_only, error

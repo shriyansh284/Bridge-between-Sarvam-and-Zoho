@@ -102,4 +102,5 @@ async def health():
     status = get_status()
     return {"ok": True, "scheduler_heartbeat": status.get("scheduler_heartbeat"),
             "mail_last_check": status.get("mail_last_check"), "last_webhook": status.get("last_webhook"),
-            "result_poll": status.get("result_poll"), "calls_paused": status.get("calls_paused")}
+            "result_poll": status.get("result_poll"), "calls_paused": status.get("calls_paused"),
+            "drop_last_check": status.get("drop_last_check") if settings.drop_dir else None}

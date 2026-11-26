@@ -107,6 +107,17 @@ class Settings:
     send_ack: bool = _bool("SEND_ACK", True)
     duplicate_file_days: int = _int("DUPLICATE_FILE_DAYS", 7)
 
+    # --- Client file drop over SFTP (OPTIONAL; ams/dropfolder.py) ---------
+    # The client uploads files into DROP_DIR/inbox; results are written to DROP_DIR/results instead of
+    # being emailed. deploy/setup_sftp.sh creates the folder and the client's SFTP login. Blank = off.
+    drop_dir: str = _get("DROP_DIR", "")
+    drop_poll_seconds: int = _int("DROP_POLL_SECONDS", 30)
+    drop_settle_seconds: int = _int("DROP_SETTLE_SECONDS", 60)   # a file must be unchanged this long (upload done)
+    drop_result_format: str = _get("DROP_RESULT_FORMAT", "csv").lower()  # csv | xlsx | both
+    # Each file's own dates show their order (25/11 or 11/25); this decides only when every date in a file reads
+    # either way (05/11/2026): dmy = day first (the template) | mdy = month first (the client's form).
+    drop_date_order: str = _get("DROP_DATE_ORDER", "dmy").lower()
+
     # --- Public URLs (OPTIONAL) -----------------------------------------
     # Without a public address the app fetches each call's result from Sarvam every RESULT_POLL_SECONDS,
     # and recording links in the Excel point at Sarvam's own signed links. With one, Sarvam also posts

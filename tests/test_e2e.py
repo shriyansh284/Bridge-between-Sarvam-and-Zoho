@@ -7,20 +7,18 @@ client email -> campaign -> calls at scheduled times -> Sarvam webhooks ->
 update email per finished time slot -> final email, all in the same thread.
 """
 import io
-import threading
 import time
 from datetime import datetime, timedelta
 
 import pytest
 import requests
-import uvicorn
 from openpyxl import Workbook, load_workbook
 
-from ams import mailer, scheduler, server
+from ams import mailer, scheduler
 from ams.campaigns import TERMINAL
 from ams.store import campaign_dir, campaign_tx, list_campaign_ids, load_campaign
 from ams.timeutil import LOCAL_TZ, iso, utcnow
-from tools import mock_sarvam, mock_zoho
+from tools import mock_sarvam
 
 ZOHO = "http://127.0.0.1:19100"
 # The template's 7 columns plus optional extras a client may add (their own ID, Language, notes)
@@ -28,22 +26,7 @@ TEST_HEADERS = ["Candidate ID", "Candidate Name", "Phone Number", "Hiring Compan
                 "WhatsApp Message Date", "Call Date", "Call Time", "Language", "Additional Context"]
 
 
-def _serve(app, port):
-    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
-    threading.Thread(target=srv.run, daemon=True).start()
-    for _ in range(100):
-        if srv.started:
-            return srv
-        time.sleep(0.05)
-    raise RuntimeError(f"server on {port} did not start")
-
-
-@pytest.fixture(scope="module", autouse=True)
-def servers():
-    running = [_serve(mock_sarvam.app, 19000), _serve(mock_zoho.app, 19100), _serve(server.app, 18000)]
-    yield
-    for srv in running:
-        srv.should_exit = True
+pytestmark = pytest.mark.usefixtures("servers")  # mock Sarvam, mock Zoho and the backend (tests/conftest.py)
 
 
 def _xlsx(rows) -> bytes:
@@ -110,7 +93,7 @@ def test_email_campaign_end_to_end():
 
     # acknowledgement goes back in the client's thread
     scheduler.run_cycle()
-    ack = _outbox()[0]
+    ack = next(m for m in _outbox() if m["in_reply_to"] == mid)  # (other test files may have sent mail first)
     assert ack["in_reply_to"] == mid and ack["to"] == "hr@client.test" and ack["subject"].startswith("Re:")
     assert "Row 5" in ack["content"]  # the invalid row is reported (excel row 5 = C4)
 

@@ -8,6 +8,7 @@ copied into a fresh sheet first. A "Call Summary" sheet is added at the end.
 """
 from __future__ import annotations
 
+import csv
 import io
 import re
 from typing import Optional
@@ -19,7 +20,7 @@ from openpyxl.utils import get_column_letter
 from .campaigns import ATTEMPT_LABELS, ROW_LABELS, counts, next_call_time, slot_label
 from .config import settings
 from .links import recording_link
-from .sheet import read_sheet
+from .sheet import clean, read_sheet
 from .store import campaign_dir
 from .timeutil import fmt_local
 
@@ -199,10 +200,41 @@ def _summary_sheet(wb, camp: dict, final: bool) -> None:
     ws.column_dimensions["B"].width = 60
 
 
-def output_name(camp: dict, kind: str, update_no: Optional[int] = None) -> str:
+def build_results_csv(camp: dict) -> bytes:
+    """The same result columns as build_results, as a CSV (for the SFTP folder, where the client's
+    system reads the file). The client's own columns come first, unchanged; links are plain URLs."""
+    path = campaign_dir(camp["campaign_id"]) / camp["input_file"]
+    sheet = read_sheet(path.read_bytes(), camp["file_name"])
+    width = max((i + 1 for i, h in enumerate(sheet.headers) if h), default=0)  # drop empty trailing columns
+    headers = list(sheet.headers[:width])
+    col_for: dict[str, int] = {}
+    for name in result_columns():
+        if name in headers:  # the client re-sent an earlier result file: overwrite, don't duplicate
+            col_for[name] = headers.index(name)
+        else:
+            headers.append(name)
+            col_for[name] = len(headers) - 1
+
+    by_row = {r["excel_row"]: r for r in camp["rows"]}
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(headers)
+    for excel_row, cells in sheet.rows:
+        # text stays exactly as sent; Excel numbers and dates are written the way the sheet reads them
+        line = [c if isinstance(c, str) else clean(c) for c in list(cells[:width]) + [None] * (width - len(cells[:width]))]
+        line += [""] * (len(headers) - len(line))
+        row = by_row.get(excel_row)
+        if row:
+            for name, value in result_values(camp, row).items():
+                line[col_for[name]] = "" if value is None else str(value)
+        writer.writerow(line)
+    return buf.getvalue().encode("utf-8-sig")  # with a BOM, so Excel shows Indian names correctly
+
+
+def output_name(camp: dict, kind: str, update_no: Optional[int] = None, ext: str = "xlsx") -> str:
     base = f"AMS_Calling_Results_{camp['campaign_id']}"
     if kind == "final":
-        return f"{base}_FINAL.xlsx"
+        return f"{base}_FINAL.{ext}"
     if kind == "update":
-        return f"{base}_Update-{update_no or 1}.xlsx"
-    return f"{base}.xlsx"
+        return f"{base}_Update-{update_no or 1}.{ext}"
+    return f"{base}.{ext}"

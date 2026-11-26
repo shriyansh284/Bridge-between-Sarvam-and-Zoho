@@ -7,6 +7,7 @@ Background work. Runs inside server.py by default, or on its own:
 Every SCHEDULER_POLL_SECONDS: flag lost results, place due calls, fetch finished calls'
 results from Sarvam (at most every RESULT_POLL_SECONDS), send due emails.
 Every MAIL_POLL_SECONDS: read new emails from the Zoho inbox.
+Every DROP_POLL_SECONDS (only when DROP_DIR is set): pick up files the client uploaded over SFTP.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from datetime import timedelta
 from .campaigns import (claim_row, due_row_ids, flag_stale, refresh_status, trigger_blocked, trigger_failed,
                         trigger_succeeded, trigger_uncertain)
 from .config import settings
+from .dropfolder import poll_drop
 from .mailer import ensure_mail_cutoff, poll_inbox, send_due_emails
 from .results import last_ok_poll, poll_results, seen_attempts
 from .sarvam import SarvamError, place_call
@@ -139,8 +141,12 @@ class Background:
             log.warning("Calls can't be placed until these are set (rows keep waiting): %s", ", ".join(missing))
         if settings.mail_enabled and settings.missing_for_mail():
             log.warning("Inbox can't be read until these are set: %s", ", ".join(settings.missing_for_mail()))
-        for fn, every, name in ((run_cycle, settings.scheduler_poll_seconds, "scheduler"),
-                                (poll_inbox, settings.mail_poll_seconds, "inbox")):
+        loops = [(run_cycle, settings.scheduler_poll_seconds, "scheduler"),
+                 (poll_inbox, settings.mail_poll_seconds, "inbox")]
+        if settings.drop_dir:
+            loops.append((poll_drop, settings.drop_poll_seconds, "sftp-folder"))
+            log.info("Watching the SFTP folder %s/inbox every %s sec", settings.drop_dir, settings.drop_poll_seconds)
+        for fn, every, name in loops:
             t = threading.Thread(target=self._loop, args=(fn, every, name), name=name, daemon=True)
             t.start()
             self._threads.append(t)
@@ -159,6 +165,8 @@ def main():
     if args.once:
         ensure_mail_cutoff()
         log.info("inbox: %s", poll_inbox())
+        if settings.drop_dir:
+            log.info("sftp folder: %s", poll_drop())
         log.info("cycle: %s", run_cycle())
         return
     bg = Background()

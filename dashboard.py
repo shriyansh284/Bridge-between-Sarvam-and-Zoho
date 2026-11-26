@@ -1,5 +1,5 @@
 """
-Internal dashboard for the AMS team (clients only use email).
+Internal dashboard for the AMS team (clients use email, or the SFTP folder).
 
     streamlit run dashboard.py
 
@@ -17,7 +17,7 @@ st.set_page_config(page_title="AMS Calling Automation", layout="wide")
 
 from ams import email_settings  # noqa: E402
 from ams.campaigns import (ATTEMPT_LABELS, ROW_LABELS, WAITING, TERMINAL, campaign_action, change_recipient,  # noqa: E402
-                           counts, next_call_time, row_action, slot_label)
+                           counts, delivers, next_call_time, row_action, slot_label)
 from ams.config import BASE_DIR, settings  # noqa: E402
 from ams.excel_out import build_results, format_duration, humanize, output_name  # noqa: E402
 from ams.mailer import handle_file, held_emails, release_held_emails  # noqa: E402
@@ -88,6 +88,16 @@ def system_panel() -> None:
     if paused := status.get("calls_paused"):
         st.error(f"Calls are paused since {fmt_local(paused['at'])}: {paused['reason']}. Waiting calls are kept, "
                  "not failed. Fix the Sarvam values in .env (python -m ams.sarvam_setup check) and restart the backend.")
+    if settings.drop_dir:
+        drop = status.get("drop_last_check") or {}
+        if not drop:
+            st.warning(f"The SFTP folder {settings.drop_dir} hasn't been checked yet (is the backend running?).")
+        elif not drop.get("ok"):
+            st.error(f"SFTP folder problem at {fmt_local(drop['at'])}: {drop.get('error')}. Files in the inbox wait "
+                     "until it's fixed (deploy/setup_sftp.sh sets the folders up).")
+        else:
+            st.caption(f"SFTP folder {settings.drop_dir} checked {_ago(drop.get('at'))}"
+                       + (f"; {drop['waiting']} file(s) still uploading" if drop.get("waiting") else ""))
     for label, missing in (("Calls", settings.missing_for_calling()), ("Email", settings.missing_for_mail())):
         if missing:
             st.warning(f"{label} can't work until these settings are filled in .env: {', '.join(missing)}"
@@ -115,13 +125,13 @@ def overview(campaigns: list[dict]) -> None:
     table = pd.DataFrame([{
         "Campaign": camp["campaign_id"],
         "Received": fmt_local(camp["created_at"]),
-        "From": camp.get("reply_to") or f"Upload by {camp.get('created_by')}",
+        "From": camp.get("reply_to") or ("SFTP folder" if camp.get("drop") else f"Upload by {camp.get('created_by')}"),
         "File": camp["file_name"],
         "Candidates": counts(camp)["total"],
         "Done": f"{counts(camp)['done']}/{counts(camp)['valid']}",
         "Status": CAMPAIGN_LABELS.get(camp["status"], camp["status"]),
         "Next call": fmt_local(next_call_time(camp)) if next_call_time(camp) else "",
-        "Emails sent": sum(1 for e in camp["emails"] if e["status"] == "sent"),
+        "Results sent": sum(1 for e in camp["emails"] if e["status"] == "sent"),
     } for camp in campaigns])
     st.caption("Select a campaign to see its calls.")
     event = st.dataframe(table, hide_index=True, on_select="rerun", selection_mode="single-row",
@@ -151,6 +161,7 @@ def campaign_detail(cid: str, user: str) -> None:
     email = camp.get("email") or {}
     sender = camp["original_sender"] if "original_sender" in camp else camp.get("reply_to")
     st.caption(f"Received {fmt_local(camp['created_at'])}"
+               + (f" through the SFTP folder (processed/{camp['drop'].get('processed_as')})" if camp.get("drop") else "")
                + (f" from {sender}, subject \"{email.get('subject', '')}\"" if sender else "")
                + (f". Results now go to {camp['reply_to']}" if camp.get("recipient_changes") else ""))
     if c["valid"]:
@@ -168,21 +179,25 @@ def campaign_detail(cid: str, user: str) -> None:
                          file_name=output_name(camp, "current"))
     a[1].download_button("Download original file", (campaign_dir(cid) / camp["input_file"]).read_bytes(),
                          file_name=camp["file_name"])
-    if a[2].button("Email an update now", disabled=not camp.get("reply_to")):
+    if a[2].button("Write an update now" if camp.get("drop") else "Email an update now", disabled=not delivers(camp)):
         st.session_state["flash"] = campaign_action(cid, "send_update")
         st.rerun()
     if a[3].button("Cancel waiting calls", disabled=not c["waiting"]):
         st.session_state["flash"] = campaign_action(cid, "cancel_remaining")
         st.rerun()
 
-    with st.expander(f"Results are emailed to: {camp.get('reply_to') or 'nobody (download only)'}. Change"):
-        st.caption("Use this when the client's email id is replaced during a campaign. Updates, the final file "
-                   "and resends go to the new address, still as replies in the original email thread.")
-        with st.form(f"recipient_{cid}"):
-            new_to = st.text_input("Email results to", value=camp.get("reply_to") or "")
-            if st.form_submit_button("Save address"):
-                st.session_state["flash"] = change_recipient(cid, new_to, user)
-                st.rerun()
+    if camp.get("drop"):
+        st.caption("Results are written to the client's SFTP folder: results/ (an in-progress file, then the FINAL "
+                   "file) and errors/. Nothing is emailed for this campaign.")
+    else:
+        with st.expander(f"Results are emailed to: {camp.get('reply_to') or 'nobody (download only)'}. Change"):
+            st.caption("Use this when the client's email id is replaced during a campaign. Updates, the final file "
+                       "and resends go to the new address, still as replies in the original email thread.")
+            with st.form(f"recipient_{cid}"):
+                new_to = st.text_input("Email results to", value=camp.get("reply_to") or "")
+                if st.form_submit_button("Save address"):
+                    st.session_state["flash"] = change_recipient(cid, new_to, user)
+                    st.rerun()
 
     rows = camp["rows"]
     table = pd.DataFrame([{
@@ -200,7 +215,7 @@ def campaign_detail(cid: str, user: str) -> None:
     if event and event.selection.rows:
         row_detail(camp, rows[event.selection.rows[0]])
 
-    st.markdown("**Emails**")
+    st.markdown("**Result files written to the SFTP folder**" if camp.get("drop") else "**Emails**")
     if camp["emails"]:
         st.dataframe(pd.DataFrame([{
             "Type": e["kind"].capitalize() + (f" {e.get('update_no')}" if e.get("update_no") else ""),
@@ -208,7 +223,7 @@ def campaign_detail(cid: str, user: str) -> None:
             "Sent": fmt_local(e.get("sent_at")) if e.get("sent_at") else "",
             "File": (e.get("file") or "").replace("outputs/", ""), "Error": e.get("error") or "",
         } for e in camp["emails"]]), hide_index=True)
-        if st.button("Resend last email"):
+        if st.button("Write the last result file again" if camp.get("drop") else "Resend last email"):
             st.session_state["flash"] = campaign_action(cid, "resend_last")
             st.rerun()
         for e in camp["emails"]:
@@ -416,6 +431,10 @@ def inbox_log() -> None:
     st.caption(f"Polling {email_settings.mailbox() or '(no AMS mailbox set)'}, folder "
                f"{settings.zoho_folder}, every {settings.mail_poll_seconds} sec. Allowed senders: "
                f"{', '.join(email_settings.allowed_senders()) or 'anyone'}.")
+    if settings.drop_dir:
+        st.caption(f"Also watching the SFTP folder {settings.drop_dir}/inbox every {settings.drop_poll_seconds} sec "
+                   f"(files appear below as \"SFTP upload\"; dates read as "
+                   f"{'MM/DD/YYYY' if settings.drop_date_order == 'mdy' else 'DD-MM-YYYY'}).")
     cutoff = get_status().get("mail_cutoff")
     st.caption(f"Only emails received after {fmt_local(cutoff)} (when the system went live) can start campaigns; "
                "older mail in the inbox is skipped. Forward an old email again to process it."

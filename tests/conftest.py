@@ -2,7 +2,11 @@
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
+
+import pytest
 
 _tmp = tempfile.mkdtemp(prefix="ams-test-")
 os.environ.update({
@@ -22,3 +26,27 @@ os.environ.update({
     "MOCK_RESULT": "digit", "MOCK_DELAY": "0.5",
 })
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+def _serve(app, port):
+    import uvicorn
+
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    threading.Thread(target=srv.run, daemon=True).start()
+    for _ in range(100):
+        if srv.started:
+            return srv
+        time.sleep(0.05)
+    raise RuntimeError(f"server on {port} did not start")
+
+
+@pytest.fixture(scope="session")
+def servers():
+    """Mock Sarvam (calls + results), mock Zoho Mail and the backend's webhook, once for all test files."""
+    from ams import server
+    from tools import mock_sarvam, mock_zoho
+
+    running = [_serve(mock_sarvam.app, 19000), _serve(mock_zoho.app, 19100), _serve(server.app, 18000)]
+    yield
+    for srv in running:
+        srv.should_exit = True

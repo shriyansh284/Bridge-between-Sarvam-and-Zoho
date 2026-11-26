@@ -37,6 +37,27 @@ All seven are required. A row missing a value is reported in the "received" repl
 
 A file the system can't use gets a reply listing the problem, the attached CSV template and this table. Rows with problems (bad number, unreadable date) are reported and not called, while the rest go ahead. Results come back as an Excel file (`.xlsx`), even for CSV input, so the recording links are clickable and the summary sheet fits.
 
+## Client SFTP folder (instead of email)
+
+The client can also upload files over SFTP, and collect the results the same way, with no email at all. On the server, `sudo bash deploy/setup_sftp.sh` creates an SFTP-only login locked into its own folder (it can see nothing else on the server), sets `DROP_DIR` in `.env` and prints the login details to send to the client; see [DEVOPS_DEPLOYMENT.md](DEVOPS_DEPLOYMENT.md). Email keeps working alongside it.
+
+```
+DROP_DIR/inbox/       the client uploads .csv or .xlsx files here (header row required)
+DROP_DIR/processed/   each file moves here once it's picked up (within about a minute)
+DROP_DIR/results/     <file>_<campaign>_RESULTS.csv at once (the schedule, and rows that can't be called),
+                      replaced after every finished call time, then <file>_<campaign>_FINAL.csv
+DROP_DIR/errors/      files that can't be used, each with a note saying what to fix (a.csv -> a.csv_ERROR.txt)
+```
+
+- A file is read only after it has stopped changing for `DROP_SETTLE_SECONDS` (60), so a half-uploaded file is never used. Temporary upload names (`.filepart`, `.part`, `.tmp`, names starting with a dot) are skipped. Every file the app writes appears under its final name in one step.
+- Results are CSV by default, because the client's system reads them (`DROP_RESULT_FORMAT=xlsx` or `both` for Excel). The client's own columns come first, unchanged, then the same result columns as by email. The Recording Link is a plain URL.
+- The same safety rules as email apply: the same file uploaded again within `DUPLICATE_FILE_DAYS` isn't called again (it goes to `errors/` with a note), and a corrected FINAL replaces the old one if a late result arrives.
+- **Every row is called at its own date and time**, whenever the file arrives: a file uploaded at 10:30 with a record for 11:15 the same day gets that call at 11:15. A time that has just passed (within 24 hours) is called right away; times outside the calling hours move to the next morning. The results file is updated as each call time finishes.
+- **Dates are read the way each file writes them.** 25/11/2026 can only be day first and 11/25/2026 only month first, so one such date settles the whole file. Only when every date in a file could be read either way (05/11/2026) does `DROP_DATE_ORDER` decide (`mdy` for this client's form, which writes 11/25/2026). A file that uses both orders is refused as a whole, so no call goes out on a wrong day. The agent always gets the WhatsApp date as DD-MM-YYYY.
+- **The client's calling form** is understood as it is: Person to Call → `name`, Call on Behalf of → `Name_of_Hiring_company`, Reason for Calling → `pending_document_names` (the form has no documents field, so the documents go there; a real Pending Documents column wins if present), WhatsApp Message Date → `whatsapp_message_date`, Phone Number to Call → `phone_number` (10 digits; +91 and spaces are fine), Date to Call + Time to Call (or Date and Time To Call) → when to call. AI Call Agent Persona, AI Call Category and any other columns are kept and returned unchanged. Row problems name the client's own column ("Reason for Calling is empty").
+- **A record sent again is not called twice.** A row whose phone number already has a call at the same date and time in another campaign (within `DUPLICATE_FILE_DAYS`) is skipped, and its Remarks name that campaign. NOW rows have no time to compare, so they are always called.
+- To try it on a PC, set `DROP_DIR` to any folder (e.g. `DROP_DIR=D:/ams-drop`), start the backend, and put a file in its `inbox`.
+
 ## Project layout
 
 ```
@@ -44,6 +65,7 @@ ams/server.py      FastAPI: health (+ optional webhook/recording links); runs th
 ams/results.py     fetches finished calls' results from Sarvam (no public address needed)
 ams/scheduler.py   places due calls, fetches results, flags lost ones, queues and sends emails
 ams/mailer.py      Zoho inbox → campaigns; ack / update / final / rejection replies
+ams/dropfolder.py  client SFTP folder → campaigns; result files written back there
 ams/zoho.py        Zoho Mail API client (refresh-token OAuth)
 ams/campaigns.py   row states, retries, result handling, batch decisions
 ams/sheet.py       reads and validates the client's file
@@ -207,6 +229,7 @@ data/state/webhooks.jsonl                        every raw Sarvam result, fetche
 data/state/processed_messages.json               emails already handled (and ones waiting for an allowed sender)
 data/state/email_settings.json                   addresses changed in the dashboard (override .env)
 data/state/settings_log.jsonl                    who changed which address, and when
+data/state/drop_files.json                       files picked up from the SFTP folder (makes pickups restart-safe)
 ```
 
 Back up `data/` regularly; it is the only state. Old campaign folders can be archived once their FINAL email is sent (they contain a `.done` marker).

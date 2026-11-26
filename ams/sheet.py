@@ -13,6 +13,7 @@ Call time can be given as:
 """
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 import re
@@ -25,20 +26,28 @@ from openpyxl import load_workbook
 from .config import settings
 from .timeutil import fmt_local, local_to_utc, next_allowed_time, to_local, utcnow
 
+# The AMS template's names first, then the old Sarvam cohort headers, then the field names of the client's
+# own calling form ("Person to Call", "Call on Behalf of", "Phone Number to Call", "Date and Time To Call").
 FIELD_ALIASES: dict[str, list[str]] = {
     "candidate_id": ["candidate_id", "candidate_ref", "candidate_code", "id", "ref", "reference", "emp_id",
                      "employee_id", "sr_no", "s_no"],
     "phone_number": ["phone_number", "phone", "mobile", "mobile_number", "mobile_no", "phone_no",
-                     "contact_number", "contact_no", "contact"],
-    "candidate_name": ["candidate_name", "name", "candidate", "full_name"],
-    "hiring_company": ["hiring_company", "name_of_hiring_company", "company", "company_name", "co", "client_company"],
+                     "contact_number", "contact_no", "contact", "phone_number_to_call", "number_to_call"],
+    "candidate_name": ["candidate_name", "name", "candidate", "full_name", "person_to_call"],
+    "hiring_company": ["hiring_company", "name_of_hiring_company", "company", "company_name", "co", "client_company",
+                       "call_on_behalf_of", "on_behalf_of"],
+    # the client's form has no documents field: "Reason for Calling" carries them (used only without the above)
     "pending_documents": ["pending_documents", "pending_document_names", "pending_document", "pending_docs",
-                          "documents", "docs", "doc"],
-    "whatsapp_message_date": ["whatsapp_message_date", "message_date", "msg_date", "whatsapp_date"],
+                          "documents", "docs", "doc", "reason_for_calling", "reason_for_call", "call_reason"],
+    "whatsapp_message_date": ["whatsapp_message_date", "message_date", "msg_date", "whatsapp_date",
+                              "whatsapp_message_date_date"],
     "call_datetime": ["call_datetime", "call_date_time", "scheduled_call_datetime", "scheduled_datetime",
-                      "schedule", "call_schedule"],
-    "call_date": ["call_date", "scheduled_call_date", "scheduled_date", "date_of_call"],
-    "call_time": ["call_time", "scheduled_call_time", "scheduled_time", "time_of_call"],
+                      "schedule", "call_schedule", "date_and_time_to_call", "date_time_to_call",
+                      "call_date_and_time"],
+    "call_date": ["call_date", "scheduled_call_date", "scheduled_date", "date_of_call", "date_to_call",
+                  "date_and_time_to_call_date"],
+    "call_time": ["call_time", "scheduled_call_time", "scheduled_time", "time_of_call", "time_to_call",
+                  "date_and_time_to_call_time"],
     "initial_language_name": ["initial_language_name", "language", "call_language"],
     "initial_bot_message": ["initial_bot_message", "opening_line"],
     "initial_state_name": ["initial_state_name"],
@@ -132,29 +141,55 @@ def is_now(value) -> bool:
     return clean(value).upper() in NOW_WORDS
 
 
-def parse_datetime_text(text: str) -> datetime:
+def _formats(formats: list[str], order: str) -> list[str]:
+    """Numeric dates are day first (DD-MM-YYYY) unless the file's source is set to month first ("mdy",
+    as in 11/25/2026). Dates written with a month name or as YYYY-MM-DD read the same either way."""
+    if order != "mdy":
+        return formats
+    return [f.replace("%d-%m", "%m-%d").replace("%d/%m", "%m/%d").replace("%d.%m", "%m.%d") for f in formats]
+
+
+def _example(order: str) -> str:
+    return "MM/DD/YYYY, e.g. 11/20/2026" if order == "mdy" else "DD-MM-YYYY, e.g. 20-11-2026"
+
+
+def parse_datetime_text(text: str, order: str = "dmy") -> datetime:
     text = re.sub(r"\s+", " ", text.strip())
+    if re.match(r"\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}", text):  # ISO, maybe with a UTC offset (form exports)
+        try:
+            value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if value.tzinfo:
+                value = to_local(value).replace(tzinfo=None)
+            return value.replace(second=0, microsecond=0)
+        except ValueError:
+            pass
     text = re.sub(r"(?i)\s*(am|pm)$", lambda m: " " + m.group(1).upper(), text)
-    for fmt in DATETIME_FORMATS:
+    for fmt in _formats(DATETIME_FORMATS, order):
         try:
             return datetime.strptime(text, fmt)
         except ValueError:
             continue
-    raise ValueError(f"Can't read the call date/time '{text}'. Use DD-MM-YYYY HH:MM, e.g. 20-11-2026 10:30")
+    raise ValueError(f"Can't read the call date/time '{text}'. Use {_example(order)} 10:30")
 
 
-def parse_date(value) -> date:
+def parse_date(value, order: str = "dmy") -> date:
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
     text = clean(value)
-    for fmt in DATE_FORMATS:
+    iso_date = re.fullmatch(r"(\d{4}-\d{2}-\d{2})(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?", text)
+    if iso_date:
+        try:
+            return date.fromisoformat(iso_date.group(1))
+        except ValueError:
+            pass
+    for fmt in _formats(DATE_FORMATS, order):
         try:
             return datetime.strptime(text, fmt).date()
         except ValueError:
             continue
-    raise ValueError(f"Can't read the call date '{text}'. Use DD-MM-YYYY, e.g. 20-11-2026")
+    raise ValueError(f"Can't read the call date '{text}'. Use {_example(order)}")
 
 
 def parse_time(value) -> time:
@@ -181,11 +216,12 @@ def parse_time(value) -> time:
     raise ValueError(f"Can't read the call time '{clean(value)}'. Use HH:MM, e.g. 10:30 or 4:00 PM")
 
 
-def normalize_message_date(value) -> str:
+def normalize_message_date(value, order: str = "dmy") -> str:
+    """The agent always gets DD-MM-YYYY, whatever order the file used."""
     if not clean(value):
         return ""
     try:
-        return parse_date(value).strftime("%d-%m-%Y")
+        return parse_date(value, order).strftime("%d-%m-%Y")
     except ValueError:
         return clean(value)
 
@@ -226,17 +262,21 @@ def read_sheet(data: bytes, filename: str) -> SheetData:
     name = filename.lower()
     sheets: list[tuple[Optional[str], list[list]]] = []
     if name.endswith((".xlsx", ".xlsm")):
-        try:
+        try:  # a damaged or half-uploaded workbook can fail while opening or while reading rows
             wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+            first = wb.active or wb.worksheets[0]
+            order = [first.title] + [ws.title for ws in wb.worksheets if ws.title != first.title]
+            for title in order:
+                sheets.append((title, [list(r) for r in wb[title].iter_rows(values_only=True)]))
+            wb.close()
         except Exception as exc:
-            raise SheetError(f"This Excel file can't be opened ({exc.__class__.__name__}).") from exc
-        order = [wb.active.title] + [ws.title for ws in wb.worksheets if ws.title != wb.active.title]
-        for title in order:
-            sheets.append((title, [list(r) for r in wb[title].iter_rows(values_only=True)]))
-        wb.close()
+            raise SheetError(f"This Excel file can't be opened ({exc.__class__.__name__}). "
+                             "Save it again as .xlsx (or .csv) and resend it.") from exc
         kind = "xlsx"
     elif name.endswith(".csv"):
-        for enc in ("utf-8-sig", "cp1252"):
+        utf16_bom = data.startswith(codecs.BOM_UTF16_LE) or data.startswith(codecs.BOM_UTF16_BE)
+        encodings = ("utf-16",) if utf16_bom else ("utf-8-sig", "cp1252")  # Excel's "Unicode text" is UTF-16
+        for enc in encodings:
             try:
                 text = data.decode(enc)
                 break
@@ -244,7 +284,11 @@ def read_sheet(data: bytes, filename: str) -> SheetData:
                 continue
         else:
             raise SheetError("The CSV file's text encoding isn't readable. Save it as UTF-8 or as .xlsx.")
-        sheets.append((None, [list(r) for r in csv.reader(io.StringIO(text))]))
+        try:
+            text = text.replace(chr(0), "")  # stray NUL characters make Python 3.10's csv module stop
+            sheets.append((None, [list(r) for r in csv.reader(io.StringIO(text))]))
+        except csv.Error as exc:
+            raise SheetError(f"This CSV file can't be read ({exc}). Save it again as UTF-8 CSV.") from exc
         kind = "csv"
     elif name.endswith(".xls"):
         try:
@@ -300,7 +344,39 @@ def missing_columns(sheet: SheetData) -> list[str]:
     return missing
 
 
-def _schedule(sheet: SheetData, cells: list, received_utc: datetime) -> tuple[Optional[datetime], bool]:
+NUMERIC_DATE = re.compile(r"\s*(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})(?!\d)")
+DATE_FIELDS = ("call_datetime", "call_date", "call_time", "whatsapp_message_date")
+
+
+def detect_date_order(sheet: SheetData, default: str = "dmy") -> str:
+    """How this file writes numeric dates. A date like 05/11/2026 reads two ways (5 Nov or 11 May), but 25/11/2026
+    can only be day first and 11/25/2026 only month first. A file comes from one system, so one such date settles
+    the whole file. With none (every date could be either) `default` is used: the template is day first, and
+    DROP_DATE_ORDER says how the client's own system writes them. A file showing both orders is refused, so no
+    call goes out on a wrong day."""
+    columns = [sheet.mapping[f] for f in DATE_FIELDS if f in sheet.mapping]
+    seen: dict[str, tuple[int, str]] = {}
+    for excel_row, cells in sheet.rows:
+        for idx in columns:
+            value = cells[idx] if idx < len(cells) else None
+            match = NUMERIC_DATE.match(value) if isinstance(value, str) else None  # Excel date cells are exact
+            if not match:
+                continue
+            first, second = int(match.group(1)), int(match.group(2))
+            if first <= 12 < second <= 31:
+                seen.setdefault("mdy", (excel_row, value.strip()))
+            elif second <= 12 < first <= 31:
+                seen.setdefault("dmy", (excel_row, value.strip()))
+    if len(seen) == 2:
+        (r1, v1), (r2, v2) = seen["mdy"], seen["dmy"]
+        raise SheetError(f"The dates in this file are written two ways: row {r1} has '{v1}' (month first) and row "
+                         f"{r2} has '{v2}' (day first). Write every date the same way, DD-MM-YYYY (25-11-2026) or "
+                         "YYYY-MM-DD. No row was called, so that no call goes out on a wrong day.")
+    return next(iter(seen), default if default in ("dmy", "mdy") else "dmy")
+
+
+def _schedule(sheet: SheetData, cells: list, received_utc: datetime,
+              order: str = "dmy") -> tuple[Optional[datetime], bool]:
     """Returns (local datetime or None, called_now). Raises ValueError with a readable message."""
     m = sheet.mapping
     dt_val = cells[m["call_datetime"]] if "call_datetime" in m else None
@@ -312,16 +388,16 @@ def _schedule(sheet: SheetData, cells: list, received_utc: datetime) -> tuple[Op
     if clean(dt_val):
         if isinstance(dt_val, datetime):
             return dt_val.replace(second=0, microsecond=0), False
-        return parse_datetime_text(clean(dt_val)), False
+        return parse_datetime_text(clean(dt_val), order), False
     if clean(d_val):
         if not clean(t_val):
             raise ValueError("Call Time is empty")
-        return datetime.combine(parse_date(d_val), parse_time(t_val)), False
+        return datetime.combine(parse_date(d_val, order), parse_time(t_val)), False
     if clean(t_val):
         if isinstance(t_val, datetime) and t_val.year > 1900:
             return t_val.replace(second=0, microsecond=0), False
         try:  # old format: full date+time in the time column
-            return parse_datetime_text(clean(t_val)), False
+            return parse_datetime_text(clean(t_val), order), False
         except ValueError:
             raise ValueError("Call Date is empty") from None
     if settings.blank_time == "reject":
@@ -329,7 +405,10 @@ def _schedule(sheet: SheetData, cells: list, received_utc: datetime) -> tuple[Op
     return None, True
 
 
-def validate(sheet: SheetData, received_utc: Optional[datetime] = None) -> list[RowCheck]:
+def validate(sheet: SheetData, received_utc: Optional[datetime] = None, date_order: str = "dmy") -> list[RowCheck]:
+    """date_order: how numeric dates are written when the file itself doesn't show it (detect_date_order):
+    "dmy" (DD-MM-YYYY, the template) or "mdy" (MM/DD/YYYY). Raises SheetError for a file using both."""
+    date_order = detect_date_order(sheet, date_order)
     received_utc = received_utc or utcnow()
     now = utcnow()
     checks: list[RowCheck] = []
@@ -341,8 +420,8 @@ def validate(sheet: SheetData, received_utc: Optional[datetime] = None) -> list[
         chk = RowCheck(excel_row=excel_row, data=data, raw=cells)
 
         for fld, title in REQUIRED.items():
-            if not data.get(fld):
-                chk.errors.append(f"{title} is empty")
+            if not data.get(fld):  # named as in the client's own file ("Reason for Calling is empty")
+                chk.errors.append(f"{sheet.headers[sheet.mapping[fld]] or title if fld in sheet.mapping else title} is empty")
         phone = normalize_phone(cells[sheet.mapping["phone_number"]]) if "phone_number" in sheet.mapping else None
         if data.get("phone_number") and not phone:
             chk.errors.append(f"Phone number '{data['phone_number']}' is not a valid mobile number")
@@ -353,7 +432,8 @@ def validate(sheet: SheetData, received_utc: Optional[datetime] = None) -> list[
             chk.warnings.append(f"Candidate ID repeats row {seen_ids[data['candidate_id']]}")
         seen_ids.setdefault(data["candidate_id"], excel_row)
         if "whatsapp_message_date" in sheet.mapping:
-            data["whatsapp_message_date"] = normalize_message_date(cells[sheet.mapping["whatsapp_message_date"]])
+            data["whatsapp_message_date"] = normalize_message_date(cells[sheet.mapping["whatsapp_message_date"]],
+                                                                   date_order)
 
         lang = data.get("initial_language_name", "")
         if lang:
@@ -363,7 +443,7 @@ def validate(sheet: SheetData, received_utc: Optional[datetime] = None) -> list[
             data["initial_language_name"] = fixed or ""
 
         try:
-            local, call_now = _schedule(sheet, cells, received_utc)
+            local, call_now = _schedule(sheet, cells, received_utc, date_order)
         except ValueError as exc:
             chk.errors.append(str(exc))
             local, call_now = None, False
