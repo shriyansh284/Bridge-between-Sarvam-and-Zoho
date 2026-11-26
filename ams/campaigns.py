@@ -1,5 +1,6 @@
 """
-Campaign = one spreadsheet attachment. Each row is one candidate call.
+Campaign = one file the client uploaded to the SFTP folder (or one uploaded in the dashboard).
+Each row is one candidate call.
 
 Row status flow
   scheduled -> calling -> completed                      (answered)
@@ -20,7 +21,6 @@ from pathlib import Path
 from typing import Optional
 
 from .config import settings
-from .email_settings import EMAIL_RE
 from .sheet import RowCheck, SheetError, missing_columns, read_sheet, validate
 from .store import (
     campaign_dir,
@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 WAITING = {"scheduled", "retry_scheduled"}
 ACTIVE = WAITING | {"calling"}
 TERMINAL = {"invalid", "completed", "not_reachable", "failed", "cancelled", "needs_review"}
+NOT_CONNECTED = TERMINAL - {"completed"}  # finished without reaching the candidate: the missed-calls sheet
 RESULT_STATUSES = {"connected", "no_answer", "busy", "failed"}
 PLACED = RESULT_STATUSES | {"awaiting_result", "no_result"}
 
@@ -93,27 +94,6 @@ def file_sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def find_campaign(message_id: str, attachment_id: str) -> Optional[str]:
-    for cid in list_campaign_ids():
-        camp = load_campaign(cid) or {}
-        src = camp.get("email") or {}
-        if src.get("message_id") == message_id and src.get("attachment_id") == attachment_id:
-            return cid
-    return None
-
-
-def find_duplicate_file(sha: str, sender: str) -> Optional[str]:
-    cutoff = utcnow() - timedelta(days=settings.duplicate_file_days)
-    for cid in list_campaign_ids():
-        camp = load_campaign(cid) or {}
-        original = camp["original_sender"] if "original_sender" in camp else camp.get("reply_to")
-        same_client = (original or "").lower() == (sender or "").lower() or camp.get("drop")  # or sent by SFTP
-        if (camp.get("file_sha256") == sha and same_client
-                and camp.get("status") != "rejected" and parse_iso(camp["created_at"]) >= cutoff):
-            return cid
-    return None
-
-
 def find_drop_campaign(claim_id: str) -> Optional[str]:
     """The campaign already created from this SFTP upload (crash-safe: never create it twice)."""
     for cid in list_campaign_ids():
@@ -123,12 +103,11 @@ def find_drop_campaign(claim_id: str) -> Optional[str]:
 
 
 def find_duplicate_drop(sha: str) -> Optional[str]:
-    """The same file received within DUPLICATE_FILE_DAYS, over SFTP or by email (its candidates were
-    already called)."""
+    """The same file uploaded within DUPLICATE_FILE_DAYS (its candidates were already called)."""
     cutoff = utcnow() - timedelta(days=settings.duplicate_file_days)
     for cid in list_campaign_ids():
         camp = load_campaign(cid) or {}
-        if (camp.get("source") in ("sftp", "email") and camp.get("file_sha256") == sha and camp.get("status") != "rejected"
+        if (camp.get("drop") and camp.get("file_sha256") == sha and camp.get("status") != "rejected"
                 and parse_iso(camp["created_at"]) >= cutoff):
             return cid
     return None
@@ -158,14 +137,15 @@ def _skip_already_booked(rows: list[dict]) -> None:
 
 
 def delivers(camp: dict) -> bool:
-    """Whether results go anywhere by themselves: an email address, or the client's SFTP folder."""
-    return bool(camp.get("reply_to") or camp.get("drop"))
+    """Whether results are written out by themselves: files that came through the client's SFTP folder.
+    (A file uploaded in the dashboard has its results downloaded there.)"""
+    return bool(camp.get("drop"))
 
 
-def create_campaign(data: bytes, filename: str, source: str, reply_to: Optional[str] = None,
-                    email: Optional[dict] = None, created_by: str = "", drop: Optional[dict] = None) -> dict:
+def create_campaign(data: bytes, filename: str, source: str, created_by: str = "",
+                    drop: Optional[dict] = None) -> dict:
     """Validate the file and create the campaign. Raises SheetError when the file is unusable.
-    `drop`: the file came through the SFTP folder, so results are written there instead of emailed."""
+    `drop`: the file came through the SFTP folder, so its results are written back there."""
     sheet = read_sheet(data, filename)
     missing = missing_columns(sheet)
     if missing:
@@ -173,7 +153,7 @@ def create_campaign(data: bytes, filename: str, source: str, reply_to: Optional[
     if not sheet.rows:
         raise SheetError("The sheet has a header but no candidate rows.")
 
-    # Email and dashboard files use the template (day first); the client's own system may write month first
+    # Dashboard uploads use the template (day first); the client's own system may write month first
     checks = validate(sheet, date_order=settings.drop_date_order if drop else "dmy")
     cid = new_campaign_id()
     ext = Path(filename).suffix.lower() or ".xlsx"
@@ -186,8 +166,6 @@ def create_campaign(data: bytes, filename: str, source: str, reply_to: Optional[
         "created_at": iso(utcnow()),
         "source": source,
         "created_by": created_by,
-        "email": email,
-        "reply_to": reply_to,
         "drop": drop,
         "file_name": filename,
         "input_file": f"input{ext}",
@@ -198,13 +176,13 @@ def create_campaign(data: bytes, filename: str, source: str, reply_to: Optional[
         "headers": sheet.headers,
         "status": "scheduled" if valid else "rejected",
         "rows": rows,
-        "emails": [],
+        "deliveries": [],  # result files to write: ack, updates, final (ams/outbox.py)
         "slots_sent": [],
         "last_update_done": 0,
         "final_sent": False,
     }
-    if (reply_to and settings.send_ack) or drop:  # over SFTP the "received" file is the only confirmation
-        queue_email(camp, "rejected" if not valid else "ack", "ack")
+    if drop:  # the "received" file is the client's confirmation
+        queue_delivery(camp, "rejected" if not valid else "ack", "ack")
     save_campaign(camp)
     log.info("Created %s from %s: %s rows, %s valid", cid, filename, len(rows), len(valid))
     return camp
@@ -474,26 +452,26 @@ def apply_result(payload: dict) -> str:
     return "processed"
 
 
-# ---------------------------------------------------------------- result emails
-def queue_email(camp: dict, kind: str, key: str, info: Optional[dict] = None) -> dict:
+# ---------------------------------------------------------------- result files
+def queue_delivery(camp: dict, kind: str, key: str, info: Optional[dict] = None) -> dict:
     rec = {"key": key, "kind": kind, "status": "pending", "failures": 0, "created_at": iso(utcnow()),
            "counts": counts(camp), **(info or {})}
-    camp["emails"].append(rec)
+    camp["deliveries"].append(rec)
     return rec
 
 
-def decide_emails(camp: dict) -> None:
-    """Inside a campaign_tx: queue the next update / final email (or SFTP result file) if one is due."""
+def decide_deliveries(camp: dict) -> None:
+    """Inside a campaign_tx: queue the next update / final result file if one is due."""
     if not delivers(camp) or camp["status"] == "rejected" or camp.get("final_sent"):
         return
-    if any(e["kind"] == "final" and e["status"] in ("pending", "sending", "failed") for e in camp["emails"]):
-        return  # a final email is already on its way (or needs a manual resend)
+    if any(e["kind"] == "final" and e["status"] in ("pending", "sending", "failed") for e in camp["deliveries"]):
+        return  # a final file is already on its way (or needs a manual rewrite)
     valid = [r for r in camp["rows"] if r["status"] != "invalid"]
     if not valid:
         return
     if all(r["status"] in TERMINAL for r in valid):
-        n = sum(1 for e in camp["emails"] if e["kind"] == "final") + 1
-        queue_email(camp, "final", f"final-{n}", {"slots": sorted({r["slot"] for r in valid})})
+        n = sum(1 for e in camp["deliveries"] if e["kind"] == "final") + 1
+        queue_delivery(camp, "final", f"final-{n}", {"slots": sorted({r["slot"] for r in valid})})
         return
     if settings.batch_mode == "slot":
         slots: dict[str, list] = {}
@@ -503,14 +481,14 @@ def decide_emails(camp: dict) -> None:
                     if s not in camp["slots_sent"] and all(r["status"] in TERMINAL for r in rows)]
         if finished:
             camp["slots_sent"].extend(finished)
-            n = sum(1 for e in camp["emails"] if e["kind"] == "update") + 1
-            queue_email(camp, "update", f"update-{n}", {"slots": sorted(finished), "update_no": n})
+            n = sum(1 for e in camp["deliveries"] if e["kind"] == "update") + 1
+            queue_delivery(camp, "update", f"update-{n}", {"slots": sorted(finished), "update_no": n})
     elif settings.batch_mode == "size":
         done = counts(camp)["done"]
         if done - camp.get("last_update_done", 0) >= settings.batch_size:
             camp["last_update_done"] = done
-            n = sum(1 for e in camp["emails"] if e["kind"] == "update") + 1
-            queue_email(camp, "update", f"update-{n}", {"update_no": n})
+            n = sum(1 for e in camp["deliveries"] if e["kind"] == "update") + 1
+            queue_delivery(camp, "update", f"update-{n}", {"update_no": n})
 
 
 def slot_label(slot: str) -> str:
@@ -531,7 +509,7 @@ def reopen(camp: dict) -> None:
     would wrongly mark the campaign finished. One that is being sent right now is caught by reopened_at."""
     camp["final_sent"] = False
     camp["reopened_at"] = stamp()
-    for e in camp["emails"]:
+    for e in camp["deliveries"]:
         if e["kind"] == "final" and e["status"] in ("pending", "failed"):
             e["status"] = "superseded"
     (campaign_dir(camp["campaign_id"]) / ".done").unlink(missing_ok=True)
@@ -553,33 +531,10 @@ def row_action(cid: str, row_id: str, action: str) -> str:
             row.update(status="scheduled", next_call_at=iso(next_allowed_time(now)), trigger_errors=0,
                        note="Call again requested from the dashboard")
             reopen(camp)
-            msg = "One more call is queued. A new final file will be sent when it finishes."
+            msg = "One more call is queued. A new final file will be written when it finishes."
         else:
             return "That action isn't available for this row any more. Refresh and try again."
         refresh_status(camp)
-    return msg
-
-
-def change_recipient(cid: str, address: str, user: str = "") -> str:
-    """Send this campaign's remaining emails (updates, final, resends) to another address,
-    e.g. when the client's email id is replaced. Replies stay in the original email thread."""
-    address = (address or "").strip().lower()
-    if not EMAIL_RE.match(address):
-        return f"'{address}' isn't a valid email address."
-    with campaign_tx(cid) as camp:
-        if camp.get("drop"):
-            return f"{cid} came through the SFTP folder; its results are written there, not emailed."
-        old = camp.get("reply_to")
-        if old == address:
-            return f"Results for {cid} already go to {address}."
-        camp.setdefault("original_sender", old)
-        camp["reply_to"] = address
-        camp.setdefault("recipient_changes", []).append({"at": iso(utcnow()), "by": user, "from": old, "to": address})
-        (campaign_dir(cid) / ".done").unlink(missing_ok=True)  # a finished campaign without an address gets its final
-        already_final = bool(camp.get("final_sent"))
-    msg = f"Results for {cid} will now be emailed to {address}" + (f" instead of {old}." if old else ".")
-    if already_final:
-        msg += " The final file was already sent; use Resend last email to send it to the new address."
     return msg
 
 
@@ -595,18 +550,16 @@ def campaign_action(cid: str, action: str) -> str:
             return f"Cancelled {n} waiting call(s). Calls already in progress will still report back."
         if action == "send_update":
             if not delivers(camp):
-                return "This campaign has no email address to send to. Download the file instead."
-            n = sum(1 for e in camp["emails"] if e["kind"] == "update") + 1
-            queue_email(camp, "update", f"update-{n}", {"update_no": n, "manual": True})
+                return "This campaign was uploaded in the dashboard: download its results instead."
+            n = sum(1 for e in camp["deliveries"] if e["kind"] == "update") + 1
+            queue_delivery(camp, "update", f"update-{n}", {"update_no": n, "manual": True})
             (campaign_dir(cid) / ".done").unlink(missing_ok=True)
-            if camp.get("drop"):
-                return "The current results will be written to the client's SFTP results folder within a minute."
-            return "An update with the current results will be emailed within a minute."
+            return "The current results will be written to the client's SFTP results folder within a minute."
         if action == "resend_last":
-            if not camp["emails"]:
-                return "No email has been sent for this campaign yet."
-            last = camp["emails"][-1]
+            if not camp["deliveries"]:
+                return "No result file has been written for this campaign yet."
+            last = camp["deliveries"][-1]
             last.update(status="pending", failures=0, error=None)
             (campaign_dir(cid) / ".done").unlink(missing_ok=True)
-            return f"The last email ({last['kind']}) will be sent again within a minute."
+            return f"The last result file ({last['kind']}) will be written again within a minute."
     return "Unknown action."

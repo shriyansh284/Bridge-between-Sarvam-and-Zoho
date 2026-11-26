@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 _tmp = tempfile.mkdtemp(prefix="ams-test-")
+os.makedirs(os.path.join(_tmp, "sftp"))
 os.environ.update({
     "AMS_NO_DOTENV": "1",  # never read the real .env (keys, addresses) during tests
     "DATA_DIR": _tmp,
@@ -17,9 +18,7 @@ os.environ.update({
     "SARVAM_AGENT_PHONE_NUMBER": "+918000000000",
     "SARVAM_OUTBOUND_BASE": "http://127.0.0.1:19000/api/outbounds",
     "SARVAM_ANALYTICS_BASE": "http://127.0.0.1:19000/api/analytics",
-    "ZOHO_ACCOUNTS_URL": "http://127.0.0.1:19100", "ZOHO_MAIL_API_URL": "http://127.0.0.1:19100",
-    "ZOHO_CLIENT_ID": "x", "ZOHO_CLIENT_SECRET": "x", "ZOHO_REFRESH_TOKEN": "x",
-    "ZOHO_FROM_ADDRESS": "calling@ams.test", "ALLOWED_SENDERS": "@client.test",
+    "DROP_DIR": os.path.join(_tmp, "sftp"), "DROP_SETTLE_SECONDS": "0",  # the client's SFTP folder
     "PUBLIC_BASE_URL": "http://127.0.0.1:18000", "WEBHOOK_SECRET": "hook-secret",
     "CALL_WINDOW_START": "00:00", "CALL_WINDOW_END": "23:59",
     "MAX_ATTEMPTS": "2", "RETRY_GAP_MINUTES": "0", "BACKGROUND_IN_SERVER": "false", "RESULT_POLL_SECONDS": "0",
@@ -42,11 +41,11 @@ def _serve(app, port):
 
 @pytest.fixture(scope="session")
 def servers():
-    """Mock Sarvam (calls + results), mock Zoho Mail and the backend's webhook, once for all test files."""
+    """Mock Sarvam (calls + results) and the backend's webhook, once for all test files."""
     from ams import server
-    from tools import mock_sarvam, mock_zoho
+    from tools import mock_sarvam
 
-    running = [_serve(mock_sarvam.app, 19000), _serve(mock_zoho.app, 19100), _serve(server.app, 18000)]
+    running = [_serve(mock_sarvam.app, 19000), _serve(server.app, 18000)]
     yield
     for srv in running:
         srv.should_exit = True

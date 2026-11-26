@@ -1,8 +1,8 @@
 """
 Client files through the SFTP folder (ams/dropfolder.py), against mock Sarvam (no real calls):
 
-inbox/<file> -> processed/<file> -> results/<file>_<campaign>_RESULTS.csv -> ..._FINAL.csv,
-bad files -> errors/ with a note. No email is ever sent for these campaigns.
+inbox/<file> -> send/<file>_<campaign>_RESULTS.csv -> ..._FINAL.csv, candidates not reached ->
+failed/<file>_<campaign>_MISSED_CALLS.csv, bad files -> failed/ with a note.
 """
 import csv
 import io
@@ -11,7 +11,6 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
-import requests
 
 from ams import dropfolder, scheduler
 from ams.campaigns import TERMINAL
@@ -66,7 +65,7 @@ def _run_until(predicate, seconds=30):
     raise AssertionError("condition not reached")
 
 
-def test_sftp_file_to_final_result_without_any_email(drop):
+def test_sftp_file_to_final_result(drop):
     later = datetime.now(LOCAL_TZ) + timedelta(hours=2)
     _upload(drop, "batch_26Nov.csv", "\n".join([
         HEADER + ",Client Ref",  # an extra column of the client's own comes back unchanged
@@ -81,47 +80,49 @@ def test_sftp_file_to_final_result_without_any_email(drop):
 
     stats = dropfolder.poll_drop()
     assert stats["campaigns"] == 1
-    assert sorted(p.name for p in (drop / "inbox").iterdir()) == [".hidden.csv", "next.csv.filepart"]
-    assert (drop / "processed" / "batch_26Nov.csv").exists()
+    assert sorted(p.name for p in (drop / "inbox").iterdir()) == [".hidden.csv", "next.csv.filepart"]  # picked up
     cid = _campaign_for("batch_26Nov.csv")
     camp = load_campaign(cid)
-    assert camp["source"] == "sftp" and camp["reply_to"] is None
-    assert any(e.get("from") == "SFTP upload" and e.get("campaign") == cid for e in read_log("mail_log"))
+    assert camp["source"] == "sftp" and (campaign_dir(cid) / "input.csv").exists()  # the original is kept here
+    assert any(e.get("from") == "SFTP upload" and e.get("campaign") == cid for e in read_log("file_log"))
 
     # the "received" file appears straight away: the schedule, and the row that can't be called
     scheduler.run_cycle()
     base = f"batch_26Nov_{cid}"
-    got = _csv(drop / "results" / f"{base}_RESULTS.csv")
+    got = _csv(drop / "send" / f"{base}_RESULTS.csv")
     assert got["Bad Number"]["Call Status"] == "Not called (invalid row)" and "12345" in got["Bad Number"]["Remarks"]
     assert got["Later Person"]["Remarks"].startswith("Call scheduled for")
-    assert (drop / "results" / f"{base}_RESULTS.xlsx").exists()
+    assert (drop / "send" / f"{base}_RESULTS.xlsx").exists()
+    assert list(_csv(drop / "failed" / f"{base}_MISSED_CALLS.csv")) == ["Bad Number"]  # not called: a fault
 
     def now_slot_done():
         return all(r["status"] in TERMINAL for r in load_campaign(cid)["rows"] if r["slot"] == "Immediate")
     _run_until(now_slot_done)
     scheduler.run_cycle()
-    got = _csv(drop / "results" / f"{base}_RESULTS.csv")
+    got = _csv(drop / "send" / f"{base}_RESULTS.csv")
     assert got["Asha Verma"]["Call Status"] == "Connected" and got["Asha Verma"]["Candidate Response"] == "Agreed to submit"
     assert got["Asha Verma"]["Recording Link"].startswith("http")
     assert got["Ravi Kumar"]["Call Status"] == "No Answer" and got["Ravi Kumar"]["Attempt Count"] == "2"
+    missed = _csv(drop / "failed" / f"{base}_MISSED_CALLS.csv")
+    assert sorted(missed) == ["Bad Number", "Ravi Kumar"] and missed["Ravi Kumar"]["Client Ref"] == "ref-2"
 
     with campaign_tx(cid) as c:  # the later call time comes round
         for r in c["rows"]:
             if r["status"] == "scheduled":
                 r["next_call_at"] = iso(utcnow())
     _run_until(lambda: load_campaign(cid)["final_sent"])
-    assert not (drop / "results" / f"{base}_RESULTS.csv").exists()  # replaced by the final file
-    final = _csv(drop / "results" / f"{base}_FINAL.csv")
+    assert not (drop / "send" / f"{base}_RESULTS.csv").exists()  # replaced by the final file
+    final = _csv(drop / "send" / f"{base}_FINAL.csv")
     assert final["Later Person"]["Call Status"] == "Busy"
     assert final["Asha Verma"]["Pending Documents"] == "PAN, Degree" and final["Asha Verma"]["Client Ref"] == "ref-1"
-    header = (drop / "results" / f"{base}_FINAL.csv").read_text(encoding="utf-8-sig").splitlines()[0].split(",")
+    header = (drop / "send" / f"{base}_FINAL.csv").read_text(encoding="utf-8-sig").splitlines()[0].split(",")
     assert header[:8] == HEADER.split(",") + ["Client Ref"] and header[8] == "Call Status"
-    assert (drop / "results" / f"{base}_FINAL.xlsx").exists()
-    assert not [p.name for p in (drop / "results").iterdir() if p.name.startswith(".")]  # no temporary files left
+    assert (drop / "send" / f"{base}_FINAL.xlsx").exists()
+    assert sorted(_csv(drop / "failed" / f"{base}_MISSED_CALLS.csv")) == ["Bad Number", "Later Person", "Ravi Kumar"]
+    assert (drop / "failed" / f"{base}_MISSED_CALLS.xlsx").exists()
+    assert not [p.name for d in ("send", "failed") for p in (drop / d).iterdir() if p.name.startswith(".")]
     assert (campaign_dir(cid) / ".done").exists()
-    assert all(e["via"] == "sftp" and e["status"] == "sent" for e in load_campaign(cid)["emails"])
-    mails = requests.get("http://127.0.0.1:19100/_outbox").json()
-    assert not [m for m in mails if cid in (m.get("subject") or "")]  # nothing emailed
+    assert all(d["status"] == "sent" for d in load_campaign(cid)["deliveries"])
 
 
 def test_file_still_uploading_is_left_alone(drop):
@@ -133,16 +134,16 @@ def test_file_still_uploading_is_left_alone(drop):
     assert dropfolder.poll_drop()["campaigns"] == 1
 
 
-def test_unusable_files_go_to_errors_with_a_note(drop):
+def test_unusable_files_go_to_failed_with_a_note(drop):
     _upload(drop, "no_header.csv", "Asha Verma,9876511130,ABC Ltd,PAN,25-11-2026,,NOW\n")  # data only, no header
     _upload(drop, "notes.pdf", "not a spreadsheet")
     stats = dropfolder.poll_drop()
     assert stats["rejected"] == 2 and stats["campaigns"] == 0
-    assert not list((drop / "inbox").iterdir()) and not list((drop / "processed").iterdir())
-    note = (drop / "errors" / "no_header.csv_ERROR.txt").read_text(encoding="utf-8-sig")
+    assert not list((drop / "inbox").iterdir())
+    note = (drop / "failed" / "no_header.csv_ERROR.txt").read_text(encoding="utf-8-sig")
     assert "No calls were placed" in note and "header" in note and "Pending Documents (required)" in note
-    assert (drop / "errors" / "no_header.csv").exists()
-    assert "Only .csv and .xlsx" in (drop / "errors" / "notes.pdf_ERROR.txt").read_text(encoding="utf-8-sig")
+    assert (drop / "failed" / "no_header.csv").exists()
+    assert "Only .csv and .xlsx" in (drop / "failed" / "notes.pdf_ERROR.txt").read_text(encoding="utf-8-sig")
 
 
 def test_same_file_twice_is_not_called_again(drop):
@@ -151,8 +152,8 @@ def test_same_file_twice_is_not_called_again(drop):
     assert dropfolder.poll_drop()["campaigns"] == 1
     _upload(drop, "monday.csv", text)  # same name and content again
     assert dropfolder.poll_drop()["rejected"] == 1
-    assert (drop / "processed" / "monday.csv").exists()
-    note = next((drop / "errors").glob("monday_*_ERROR.txt")).read_text(encoding="utf-8-sig")
+    assert (drop / "failed" / "monday.csv").exists() and not list((drop / "inbox").iterdir())
+    note = (drop / "failed" / "monday.csv_ERROR.txt").read_text(encoding="utf-8-sig")
     assert "already received as campaign" in note
 
 
@@ -162,26 +163,29 @@ def test_no_row_callable_gives_an_errors_file(drop):
     cid = _campaign_for("all_bad.csv")
     scheduler.run_cycle()
     assert load_campaign(cid)["status"] == "rejected"
-    note = (drop / "errors" / f"all_bad_{cid}_ERRORS.txt").read_text(encoding="utf-8-sig")
+    note = (drop / "failed" / f"all_bad_{cid}_ERRORS.txt").read_text(encoding="utf-8-sig")
     assert "Phone Number is empty" in note
-    assert _csv(drop / "errors" / f"all_bad_{cid}_ERRORS.csv")["No Phone"]["Remarks"] == "Phone Number is empty"
-    assert not list((drop / "results").glob(f"*{cid}*"))  # nothing in results/ for it
+    assert _csv(drop / "failed" / f"all_bad_{cid}_ERRORS.csv")["No Phone"]["Remarks"] == "Phone Number is empty"
+    assert not list((drop / "send").glob(f"*{cid}*"))  # nothing in send/ for it
 
 
 def test_restart_in_the_middle_of_a_pickup_never_makes_two_campaigns(drop):
-    (drop / "processed").mkdir(exist_ok=True)
-    (drop / "processed" / "crash.csv").write_bytes(
+    (drop / "inbox").mkdir(exist_ok=True)
+    (drop / "inbox" / ".picked-crash-crash.csv").write_bytes(
         (HEADER + "\nCrash Test,9876511150,ABC,PAN,25-11-2026,,NOW\n").encode("utf-8-sig"))
-    # moved out of the inbox, then the server stopped before the campaign was created
-    dropfolder._record("claim-crash", file="crash.csv", claimed_as="crash.csv", status="claimed", at=iso(utcnow()))
+    # claimed (renamed to its hidden name), then the server stopped before the campaign was created
+    dropfolder._record("claim-crash", file="crash.csv", claimed_as=".picked-crash-crash.csv", status="claimed",
+                       at=iso(utcnow()))
     assert dropfolder.poll_drop()["campaigns"] == 1
+    assert not list((drop / "inbox").iterdir())  # the claimed file is gone once its campaign exists
     # the campaign was created, then the server stopped before the pickup was marked done
     dropfolder._record("claim-crash", status="claimed")
     dropfolder.poll_drop()
     assert sum(1 for c in list_campaign_ids() if (load_campaign(c).get("drop") or {}).get("claim_id") == "claim-crash") == 1
     # stopped after the record but before the file left the inbox: picked up normally
     _upload(drop, "late.csv", HEADER + "\nLate Pickup,9876511151,ABC,PAN,25-11-2026,,NOW\n")
-    dropfolder._record("claim-late", file="late.csv", claimed_as="late.csv", status="claiming", at=iso(utcnow()))
+    dropfolder._record("claim-late", file="late.csv", claimed_as=".picked-late-late.csv", status="claiming",
+                       at=iso(utcnow()))
     assert dropfolder.poll_drop()["campaigns"] == 1
     assert "claim-late" not in dropfolder._claims()
 
@@ -221,7 +225,7 @@ def test_clients_form_export_is_fed_to_the_agent_and_called_at_each_rows_time(dr
             if r["status"] == "scheduled":
                 r["next_call_at"] = iso(utcnow())
     _run_until(lambda: load_campaign(cid)["final_sent"])
-    final = _csv_by(drop / "results" / f"form_export_{cid}_FINAL.csv", "Person to Call")
+    final = _csv_by(drop / "send" / f"form_export_{cid}_FINAL.csv", "Person to Call")
     assert final["Meera Shah"]["Call Status"] == "Connected" and final["Arjun Rao"]["Call Status"] == "Busy"
     assert final["Meera Shah"]["AI Call Agent Persona"] == "Kajal"  # their columns come back unchanged
 
@@ -238,7 +242,7 @@ def test_dates_are_read_the_way_each_file_writes_them(drop):
              f"Kajal,Pending documents,Mixed Two,PAN,ABC,25/11/2026,9876511166,{later:%m/%d/%Y},10:00"]
     _upload(drop, "mixed.csv", FORM + "\n" + "\n".join(mixed) + "\n")
     assert dropfolder.poll_drop()["rejected"] == 1
-    assert "written two ways" in (drop / "errors" / "mixed.csv_ERROR.txt").read_text(encoding="utf-8-sig")
+    assert "written two ways" in (drop / "failed" / "mixed.csv_ERROR.txt").read_text(encoding="utf-8-sig")
 
 
 def test_a_record_sent_again_in_a_later_file_is_not_called_twice(drop):
@@ -268,29 +272,29 @@ def test_a_file_that_cannot_be_read_never_blocks_the_others(drop, monkeypatch):
     _upload(drop, "fine.csv", HEADER + "\nFine File,9876511191,ABC,PAN,25-11-2026,,NOW\n")
     stats = dropfolder.poll_drop()
     assert stats["campaigns"] == 1 and stats["rejected"] == 1
-    assert "couldn't be read" in (drop / "errors" / "broken.csv_ERROR.txt").read_text(encoding="utf-8-sig")
+    assert "couldn't be read" in (drop / "failed" / "broken.csv_ERROR.txt").read_text(encoding="utf-8-sig")
 
     def no_permission(path):  # uploaded as 600: only the client's login may read it
         raise PermissionError(13, "Permission denied")
     monkeypatch.setattr(dropfolder, "_read", no_permission)
     _upload(drop, "private.csv", HEADER + "\nPrivate File,9876511192,ABC,PAN,25-11-2026,,NOW\n")
     assert dropfolder.poll_drop()["rejected"] == 1
-    assert "660" in (drop / "errors" / "private.csv_ERROR.txt").read_text(encoding="utf-8-sig")
+    assert "660" in (drop / "failed" / "private.csv_ERROR.txt").read_text(encoding="utf-8-sig")
     assert dropfolder.poll_drop() == {"files": 0, "campaigns": 0, "rejected": 0, "waiting": 0}  # nothing stuck
 
 
-def test_same_list_by_email_and_by_sftp_is_called_once(drop):
-    from ams import mailer
+def test_campaigns_not_from_the_folder_never_write_into_it(drop):
+    from ams.campaigns import create_campaign
+    from ams.outbox import send_due_results
 
-    data = (HEADER + "\nBoth Ways,9876511193,ABC,PAN,25-11-2026,,NOW\n").encode("utf-8-sig")
-    (drop / "inbox").mkdir(exist_ok=True)
-    (drop / "inbox" / "both.csv").write_bytes(data)
-    assert dropfolder.poll_drop()["campaigns"] == 1
-    before = len(list_campaign_ids())
-    requests.post("http://127.0.0.1:19100/_inject", files={"file": ("both.csv", data)},
-                  data={"from": "hr@client.test", "subject": "Same list"})
-    mailer.poll_inbox()
-    assert len(list_campaign_ids()) == before  # "already received" reply instead of a second round of calls
+    camp = create_campaign((HEADER + "\nDash Upload,9876511195,ABC,PAN,25-11-2026,,NOW\n").encode(), "dash.csv",
+                           source="dashboard", created_by="tester")
+    with campaign_tx(camp["campaign_id"]) as c:  # e.g. an email left queued by the earlier email version
+        c["deliveries"].append({"key": "ack", "kind": "ack", "status": "pending", "failures": 0,
+                                "created_at": iso(utcnow())})
+    send_due_results()
+    assert load_campaign(camp["campaign_id"])["deliveries"][0]["status"] == "skipped"
+    assert not list((drop / "send").glob(f"*{camp['campaign_id']}*"))
 
 
 def test_results_are_never_written_outside_the_sftp_folder(drop):
@@ -299,9 +303,9 @@ def test_results_are_never_written_outside_the_sftp_folder(drop):
     cid = _campaign_for("moved.csv")
     object.__setattr__(settings, "drop_dir", "")  # DROP_DIR removed from .env while the campaign runs
     scheduler.run_cycle()
-    ack = load_campaign(cid)["emails"][0]
+    ack = load_campaign(cid)["deliveries"][0]
     assert ack["status"] == "failed" and "DROP_DIR" in ack["error"]  # shown in the dashboard, retried later
-    assert not any(os.path.exists(d) for d in ("inbox", "processed", "results", "errors"))
+    assert not any(os.path.exists(d) for d in ("inbox", "send", "failed"))
 
 
 def test_date_order_detection():

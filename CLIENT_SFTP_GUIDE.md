@@ -19,11 +19,11 @@ Logins are accepted only from the IP addresses you give us.
 | Folder | What it's for |
 |---|---|
 | `inbox/` | Upload your files here. |
-| `processed/` | Your file moves here within about a minute, once we have picked it up. |
-| `results/` | `<your file name>_<campaign>_RESULTS.csv` appears straight away. It shows each candidate's scheduled call time, and any row we can't call with the reason. It is replaced after each scheduled call time has finished. When every call is done it is replaced by `<your file name>_<campaign>_FINAL.csv`. |
-| `errors/` | A file we can't use is moved here with a note saying what to fix (for `candidates.csv`, the note is `candidates.csv_ERROR.txt`). Nothing in it is called. |
+| `send/` | The output sheet. Within about a minute of your upload, `<your file name>_<campaign>_RESULTS.csv` appears here: each candidate's scheduled call time, then each call's result as it finishes (it is replaced after each scheduled call time). When every call is done it is replaced by `<your file name>_<campaign>_FINAL.csv`. |
+| `failed/` | `<your file name>_<campaign>_MISSED_CALLS.csv`: every candidate we couldn't reach (no answer or busy after the retry, failed, not called because of a problem in the row), with the reason. It is kept up to date with the output sheet. A file we can't use at all is also moved here, with a note saying what to fix (for `calls.csv`, the note is `calls.csv_ERROR.txt`). |
 
-You may delete files from `processed/`, `results/` and `errors/` once you've read them.
+Once a file is picked up it leaves `inbox/`; the RESULTS file appearing in `send/` is your confirmation. You may
+delete files from `send/` and `failed/` once you've read them.
 
 ## Uploading
 
@@ -36,10 +36,10 @@ You may delete files from `processed/`, `results/` and `errors/` once you've rea
   starting with a dot, are never read. (Without this, a file is read once it has stopped changing for one minute; an
   upload that stalls for longer could be read half-way.)
 - Uploaded files must be readable by our system: the usual permissions (`rw-rw----` / 660, or 644) are fine. A file
-  uploaded as private (600) can't be read and is moved to `errors/` with a note.
+  uploaded as private (600) can't be read and is moved to `failed/` with a note.
 - **Nobody is called twice for the same booking.** A record that comes again in a later file (same phone number, same
   call date and time) is skipped; its Remarks say which earlier upload has it. Uploading exactly the same file again
-  within 7 days is also skipped (it goes to `errors/` with a note).
+  within 7 days is also skipped (it goes to `failed/` with a note).
 
 ## File format
 

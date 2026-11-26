@@ -96,7 +96,7 @@ def _analytics_url(path: str) -> str:
             f"{settings.sarvam_workspace_id}/{settings.sarvam_app_id}/{path}")
 
 
-ANALYTICS_TIMEOUT = 15  # short: these lookups run inside the loop that also places calls and sends emails
+ANALYTICS_TIMEOUT = 15  # short: these lookups run inside the loop that also places calls and writes result files
 
 
 def _analytics_get(path: str, params: Optional[dict] = None, timeout: int = ANALYTICS_TIMEOUT) -> dict:

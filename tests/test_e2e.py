@@ -1,32 +1,35 @@
 """
-Whole flow against local mock Zoho + mock Sarvam (no real calls or emails):
+Whole flow against mock Sarvam (no real calls), through the client's SFTP folder:
 
     python -m pytest -q
 
-client email -> campaign -> calls at scheduled times -> Sarvam webhooks ->
-update email per finished time slot -> final email, all in the same thread.
+file in inbox/ -> campaign -> calls at each row's time -> results fetched from (or posted by) Sarvam ->
+send/<file>_<campaign>_RESULTS after each finished time slot -> ..._FINAL, failed/..._MISSED_CALLS, plus the
+safety rules
+(Sarvam outages, unconfirmed calls, "Call again", a write cut off by a restart).
 """
+import csv
 import io
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 import requests
 from openpyxl import Workbook, load_workbook
 
-from ams import mailer, scheduler
+from ams import dropfolder, outbox, scheduler
 from ams.campaigns import TERMINAL
+from ams.config import settings
 from ams.store import campaign_dir, campaign_tx, list_campaign_ids, load_campaign
-from ams.timeutil import LOCAL_TZ, iso, utcnow
+from ams.timeutil import LOCAL_TZ, iso, stamp, utcnow
 from tools import mock_sarvam
 
-ZOHO = "http://127.0.0.1:19100"
+pytestmark = pytest.mark.usefixtures("servers")  # mock Sarvam and the backend (tests/conftest.py)
+
 # The template's 7 columns plus optional extras a client may add (their own ID, Language, notes)
 TEST_HEADERS = ["Candidate ID", "Candidate Name", "Phone Number", "Hiring Company", "Pending Documents",
                 "WhatsApp Message Date", "Call Date", "Call Time", "Language", "Additional Context"]
-
-
-pytestmark = pytest.mark.usefixtures("servers")  # mock Sarvam, mock Zoho and the backend (tests/conftest.py)
 
 
 def _xlsx(rows) -> bytes:
@@ -42,17 +45,25 @@ def _xlsx(rows) -> bytes:
     return buf.getvalue()
 
 
-def _inject(data: bytes, name: str, sender: str = "hr@client.test", subject: str = "AMS Calling Request"):
-    r = requests.post(f"{ZOHO}/_inject", files={"file": (name, data)}, data={"from": sender, "subject": subject})
-    return r.json()["messageId"]
+def _folder(name: str) -> Path:
+    return Path(settings.drop_dir) / name
 
 
-def _outbox():
-    return requests.get(f"{ZOHO}/_outbox").json()
+def _upload(data: bytes, name: str) -> str:
+    """The client uploads a file; returns the campaign it became."""
+    _folder("inbox").mkdir(parents=True, exist_ok=True)
+    (_folder("inbox") / name).write_bytes(data)
+    assert dropfolder.poll_drop()["campaigns"] == 1
+    return next(c for c in list_campaign_ids() if (load_campaign(c).get("drop") or {}).get("file") == name)
 
 
-def _attachment(mail) -> bytes:
-    return requests.get(f"{ZOHO}/_upload", params={"path": mail["attachments"][0]["path"]}).content
+def _result(cid: str, label: str, ext: str = "csv") -> Path:
+    folder = "failed" if label == "MISSED_CALLS" else "send"
+    return _folder(folder) / f"{dropfolder.result_base(load_campaign(cid))}_{label}.{ext}"
+
+
+def _csv_rows(path: Path) -> dict:
+    return {r["Candidate ID"]: r for r in csv.DictReader(io.StringIO(path.read_text(encoding="utf-8-sig")))}
 
 
 def _run_until(predicate, seconds=30):
@@ -70,7 +81,7 @@ def _rows(ws):
     return header, {r[0]: dict(zip(header, r)) for r in ws.iter_rows(min_row=2, values_only=True) if r[0]}
 
 
-def test_email_campaign_end_to_end():
+def test_excel_file_end_to_end():
     later = datetime.now(LOCAL_TZ) + timedelta(hours=2)
     rows = [  # last digit drives the mock: 0 connected, 1 no answer, 2 busy, 3 failed
         ["C1", "Deep", "9289309920", "ABC", "PAN, Degree", "18-11-2026", "", "NOW", "Hindi", "keep me"],
@@ -82,92 +93,61 @@ def test_email_campaign_end_to_end():
         ["C6", "Rahul", "9205558162", "Birla", "Address proof", "18-11-2026", later.strftime("%d-%m-%Y"),
          later.strftime("%I:%M %p"), "", ""],
     ]
-    data = _xlsx(rows)
-    mid = _inject(data, "Nov_batch.xlsx")
-    _inject(data, "spam.xlsx", sender="stranger@elsewhere.test")
+    object.__setattr__(settings, "drop_result_format", "xlsx")  # Settings is frozen; tests only
+    try:
+        cid = _upload(_xlsx(rows), "Nov_batch.xlsx")
 
-    stats = mailer.poll_inbox()
-    assert stats["campaigns"] == 1 and stats["ignored"] == 1
-    assert mailer.poll_inbox()["emails"] == 0  # already processed, nothing new
-    cid = list_campaign_ids()[0]
+        # the "received" file: the schedule, and the row that can't be called
+        scheduler.run_cycle()
+        _, got = _rows(load_workbook(_result(cid, "RESULTS", "xlsx"))["Candidates"])
+        assert got["C4"]["Call Status"] == "Not called (invalid row)" and "12345" in got["C4"]["Remarks"]
 
-    # acknowledgement goes back in the client's thread
-    scheduler.run_cycle()
-    ack = next(m for m in _outbox() if m["in_reply_to"] == mid)  # (other test files may have sent mail first)
-    assert ack["in_reply_to"] == mid and ack["to"] == "hr@client.test" and ack["subject"].startswith("Re:")
-    assert "Row 5" in ack["content"]  # the invalid row is reported (excel row 5 = C4)
+        # first time slot (NOW) finishes -> the results file is updated
+        def slot_now_done():
+            return all(r["status"] in TERMINAL for r in load_campaign(cid)["rows"] if r["slot"] == "Immediate")
+        _run_until(slot_now_done)
+        scheduler.run_cycle()
+        assert any(d["kind"] == "update" and d["status"] == "sent" for d in load_campaign(cid)["deliveries"])
+        wb = load_workbook(_result(cid, "RESULTS", "xlsx"))
+        header, got = _rows(wb["Candidates"])
+        assert header[:10] == TEST_HEADERS
+        assert got["C1"]["Call Status"] == "Connected" and got["C1"]["Candidate Response"] == "Agreed to submit"
+        assert got["C1"]["Commitment & Timeline"] == "Will upload tomorrow" and got["C1"]["Call Quality"] == "Positive"
+        assert "Next Follow-up Date" not in header and not got["C1"]["Other Agent Outputs"]  # nothing left unmapped
+        assert got["C1"]["Additional Context"] == "keep me"
+        assert got["C2"]["Call Status"] == "No Answer" and got["C2"]["Attempt Count"] == 2
+        assert got["C3"]["Call Status"] == "Failed" and "NDNC" in got["C3"]["Remarks"]
+        assert got["C5"]["Call Status"] == "Scheduled"
 
-    # first time slot (NOW) finishes -> one update email with results so far
-    def slot_now_done():
-        camp = load_campaign(cid)
-        return all(r["status"] in TERMINAL for r in camp["rows"] if r["slot"] == "Immediate")
-    _run_until(slot_now_done)
-    scheduler.run_cycle()
-    update = [m for m in _outbox() if m["subject"].startswith("Re:") and m["attachments"]][-1]
-    assert "Update-1" in update["attachments"][0]["name"]
+        # the recording link plays without any login
+        link = wb["Candidates"].cell(2, header.index("Recording Link") + 1).hyperlink.target
+        audio = requests.get(link)
+        assert audio.status_code == 200 and audio.content[:4] == b"RIFF"
+        assert requests.get(link[:-3] + "xyz").status_code == 404  # tampered link
 
-    header, got = _rows(load_workbook(io.BytesIO(_attachment(update)))["Candidates"])
-    assert header[:10] == ["Candidate ID", "Candidate Name", "Phone Number", "Hiring Company", "Pending Documents",
-                           "WhatsApp Message Date", "Call Date", "Call Time", "Language", "Additional Context"]
-    assert got["C1"]["Call Status"] == "Connected" and got["C1"]["Candidate Response"] == "Agreed to submit"
-    assert got["C1"]["Commitment & Timeline"] == "Will upload tomorrow" and got["C1"]["Call Quality"] == "Positive"
-    assert "Next Follow-up Date" not in header and not got["C1"]["Other Agent Outputs"]  # nothing left unmapped
-    assert got["C1"]["Additional Context"] == "keep me"
-    assert got["C2"]["Call Status"] == "No Answer" and got["C2"]["Attempt Count"] == 2
-    assert got["C3"]["Call Status"] == "Failed" and "NDNC" in got["C3"]["Remarks"]
-    assert got["C4"]["Call Status"] == "Not called (invalid row)"
-    assert got["C5"]["Call Status"] == "Scheduled"
+        # make the later slot due now, then the FINAL file replaces the in-progress one
+        with campaign_tx(cid) as camp:
+            for r in camp["rows"]:
+                if r["status"] == "scheduled":
+                    r["next_call_at"] = iso(utcnow())
+        _run_until(lambda: load_campaign(cid)["final_sent"])
+        assert not _result(cid, "RESULTS", "xlsx").exists()
+        _, got = _rows(load_workbook(_result(cid, "FINAL", "xlsx"))["Candidates"])
+        assert got["C5"]["Call Status"] == "Connected" and got["C6"]["Call Status"] == "Busy"
+        assert (campaign_dir(cid) / ".done").exists()
 
-    # the recording link in the Excel plays without any login
-    wb = load_workbook(io.BytesIO(_attachment(update)))
-    ws = wb["Candidates"]
-    link_col = header.index("Recording Link") + 1
-    link = ws.cell(2, link_col).hyperlink.target
-    audio = requests.get(link)
-    assert audio.status_code == 200 and audio.content[:4] == b"RIFF"
-    assert requests.get(link[:-3] + "xyz").status_code == 404  # tampered link
-
-    # make the later slot due now, then the final email arrives
-    with campaign_tx(cid) as camp:
-        for r in camp["rows"]:
-            if r["status"] == "scheduled":
-                r["next_call_at"] = iso(utcnow())
-    _run_until(lambda: load_campaign(cid)["final_sent"])
-    final = _outbox()[-1]
-    assert final["attachments"][0]["name"].endswith("_FINAL.xlsx") and final["in_reply_to"] == mid
-    _, got = _rows(load_workbook(io.BytesIO(_attachment(final)))["Candidates"])
-    assert got["C5"]["Call Status"] == "Connected" and got["C6"]["Call Status"] == "Busy"
-    assert (campaign_dir(cid) / ".done").exists()
-
-    sent = len(_outbox())
-    scheduler.run_cycle()
-    assert len(_outbox()) == sent  # nothing is sent twice
-
-
-def test_same_file_twice_is_not_called_again():
-    data = _xlsx([["D1", "Asha", "9876500010", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]])
-    _inject(data, "first.xlsx")
-    mailer.poll_inbox()
-    before = len(list_campaign_ids())
-    _inject(data, "first-again.xlsx")
-    mailer.poll_inbox()
-    assert len(list_campaign_ids()) == before
-    assert _outbox()[-1]["subject"].startswith("Re:") and "already received" in _outbox()[-1]["content"]
-
-
-def test_unusable_file_gets_template_back():
-    _inject(b"name,company\nX,Y\n", "wrong.csv")
-    mailer.poll_inbox()
-    reply = _outbox()[-1]
-    assert "couldn't process" in reply["content"] and reply["attachments"][0]["name"] == "AMS_Calling_Template.csv"
-    assert "Pending Documents" in reply["content"] and "DD-MM-YYYY" in reply["content"]  # the format rules
+        written = len(load_campaign(cid)["deliveries"])
+        scheduler.run_cycle()
+        assert len(load_campaign(cid)["deliveries"]) == written  # nothing is written twice
+    finally:
+        object.__setattr__(settings, "drop_result_format", "csv")
 
 
 def test_predefined_csv_template_filled_in_by_the_client():
     from ams.sheet import TEMPLATE_HEADERS
 
     template = open("templates/AMS_Calling_Template.csv", encoding="utf-8-sig").read()
-    assert template.strip().split(",") == TEMPLATE_HEADERS  # the file given to clients matches the code
+    assert template.strip().split(",") == TEMPLATE_HEADERS  # the template file matches the code
     later = (datetime.now(LOCAL_TZ) + timedelta(days=1)).replace(hour=11, minute=0)
     rows = [  # Excel-saved CSV quirks included: dates with slashes, a date next to NOW, a number Excel broke
         f"Asha Verma,9876500051,ABC Ltd,\"PAN, Degree\",18-11-2026,{later:%d-%m-%Y},11:00 AM",
@@ -175,12 +155,8 @@ def test_predefined_csv_template_filled_in_by_the_client():
         "Broken Number,9.19877E+11,XYZ Pvt,Aadhaar,18-11-2026,,NOW",
         "No Message Date,9876500052,XYZ Pvt,Aadhaar,,,NOW",
     ]
-    data = (template.strip() + "\n" + "\n".join(rows) + "\n").encode("utf-8-sig")
-    mid = _inject(data, "client_data.csv")
-    mailer.poll_inbox()
-    cid = next(c for c in list_campaign_ids() if (load_campaign(c).get("email") or {}).get("message_id") == mid)
-    camp = load_campaign(cid)
-    row = {r["name"]: r for r in camp["rows"]}
+    cid = _upload((template.strip() + "\n" + "\n".join(rows) + "\n").encode("utf-8-sig"), "client_data.csv")
+    row = {r["name"]: r for r in load_campaign(cid)["rows"]}
     asha = row["Asha Verma"]
     assert asha["status"] == "scheduled" and asha["slot"] == f"{later:%Y-%m-%d} 11:00"
     assert asha["agent_variables"] == {  # exactly the agent's 5 variables, all filled
@@ -205,60 +181,11 @@ def test_webhook_security_and_duplicates():
     assert r.json()["outcome"] == "unmatched"
 
 
-def test_email_ids_can_be_changed_from_the_dashboard():
-    from ams import email_settings
-    from ams.campaigns import campaign_action, change_recipient
-    from ams.zoho import client
-
-    try:
-        # the client's new address isn't allowed yet: the email waits, unread
-        data = _xlsx([["E1", "Neha", "9876500020", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]])
-        mid = _inject(data, "new_address.xlsx", sender="new-hr@newclient.test")
-        assert mailer.poll_inbox()["ignored"] == 1
-        assert any(h["from"] == "new-hr@newclient.test" for h in mailer.held_emails())
-
-        # the team allows it (plus a copy to themselves): the waiting email is processed, no resend needed
-        email_settings.save({"allowed_senders": ["@client.test", "new-hr@newclient.test"], "cc": ["me@ams.test"]},
-                            "tester")
-        assert mailer.release_held_emails() == 1  # strangers stay held
-        assert mailer.poll_inbox()["campaigns"] == 1
-        cid = next(c for c in list_campaign_ids() if (load_campaign(c).get("email") or {}).get("message_id") == mid)
-        scheduler.run_cycle()
-        ack = next(m for m in _outbox() if m["in_reply_to"] == mid)
-        assert ack["to"] == "new-hr@newclient.test" and ack["cc"] == "me@ams.test"
-
-        # the client's address is replaced mid-campaign: results follow, still in the original thread
-        assert "will now be emailed to" in change_recipient(cid, "replacement@newclient.test", "tester")
-        assert "isn't a valid" in change_recipient(cid, "not-an-email", "tester")
-        _run_until(lambda: load_campaign(cid)["final_sent"])
-        final = [m for m in _outbox() if m["in_reply_to"] == mid][-1]
-        assert final["to"] == "replacement@newclient.test" and final["attachments"][0]["name"].endswith("_FINAL.xlsx")
-
-        # the same file from the original sender is still recognised as a duplicate
-        _inject(data, "new_address_again.xlsx", sender="new-hr@newclient.test")
-        mailer.poll_inbox()
-        assert "already received" in _outbox()[-1]["content"]
-
-        # the AMS mailbox is checked against Zoho and becomes the From address of replies
-        zm = client()
-        assert zm.check_mailbox("calling@ams.test")[0] and not zm.check_mailbox("other@ams.test")[0]
-        email_settings.save({"mailbox": "alias@ams.test"}, "tester")
-        campaign_action(cid, "resend_last")
-        scheduler.run_cycle()
-        assert _outbox()[-1]["from"] == "alias@ams.test" and _outbox()[-1]["to"] == "replacement@newclient.test"
-        assert len(email_settings.history()) == 2
-    finally:
-        email_settings.save({k: None for k in email_settings.KEYS}, "tester")
-
-
 def test_calls_wait_instead_of_failing_when_sarvam_is_not_usable(monkeypatch):
     from ams.sarvam import SarvamError
     from ams.store import get_status
 
-    data = _xlsx([["P1", "Kiran", "9876500030", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]])
-    mid = _inject(data, "paused.xlsx")
-    mailer.poll_inbox()
-    cid = next(c for c in list_campaign_ids() if (load_campaign(c).get("email") or {}).get("message_id") == mid)
+    cid = _upload(_xlsx([["P1", "Kiran", "9876500030", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]]), "paused.xlsx")
     row = lambda: load_campaign(cid)["rows"][0]  # noqa: E731
 
     # settings missing in .env: nothing is dialled, the row just waits
@@ -282,35 +209,17 @@ def test_calls_wait_instead_of_failing_when_sarvam_is_not_usable(monkeypatch):
     assert row()["attempt_count"] == 1 and not get_status().get("calls_paused")
 
 
-def test_mail_already_in_the_inbox_at_go_live_is_never_processed():
-    from ams.store import set_status
-
-    set_status("mail_cutoff", iso(utcnow()))  # go-live now; mock emails carry an older receivedTime
-    try:
-        data = _xlsx([["O1", "Old", "9876500040", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]])
-        _inject(data, "july_sheet.xlsx")  # from an allowed sender, so only the cutoff stops it
-        before = len(list_campaign_ids())
-        assert mailer.poll_inbox()["old"] == 1
-        assert len(list_campaign_ids()) == before
-        assert mailer.poll_inbox()["emails"] == 0  # remembered; not re-checked every minute
-    finally:
-        set_status("mail_cutoff", None)
-
-
 def test_no_public_address_results_are_fetched_from_sarvam():
     """The production setup: no PUBLIC_BASE_URL, so Sarvam can't post results; the app fetches them."""
-    from ams.config import settings
     from ams.store import get_status
 
     original = settings.public_base_url
-    object.__setattr__(settings, "public_base_url", "")  # Settings is frozen; tests only
+    object.__setattr__(settings, "public_base_url", "")
     try:
-        data = _xlsx([["Q1", "Meera", "9876500070", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""],   # connects
-                      ["Q2", "Kabir", "9876500072", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""],   # busy twice
-                      ["Q3", "Isha", "9876500073", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]])   # fails
-        mid = _inject(data, "no_public_address.xlsx")
-        mailer.poll_inbox()
-        cid = next(c for c in list_campaign_ids() if (load_campaign(c).get("email") or {}).get("message_id") == mid)
+        cid = _upload(_xlsx([["Q1", "Meera", "9876500070", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""],   # connects
+                             ["Q2", "Kabir", "9876500072", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""],   # busy twice
+                             ["Q3", "Isha", "9876500073", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]]),  # fails
+                      "no_public_address.xlsx")
         _run_until(lambda: load_campaign(cid)["final_sent"], seconds=45)
 
         sent = [b for b in mock_sarvam.CALLS if b["user_config"]["user_phone_number"] in
@@ -325,26 +234,19 @@ def test_no_public_address_results_are_fetched_from_sarvam():
         assert rows["Q3"]["status"] == "failed" and rows["Q3"]["note"] == "Call could not be placed"
         assert get_status()["last_webhook"]["via"] == "poll" and get_status()["result_poll"]["ok"]
 
-        final = [m for m in _outbox() if m["in_reply_to"] == mid][-1]
-        wb = load_workbook(io.BytesIO(_attachment(final)))
-        header, got = _rows(wb["Candidates"])
+        got = _csv_rows(_result(cid, "FINAL"))
         assert got["Q1"]["Candidate Response"] == "Agreed to submit" and got["Q2"]["Call Status"] == "Busy"
         assert "Agent: Hello, am I speaking with Meera?" in got["Q1"]["Transcript"]
-        link_cell = wb["Candidates"].cell(2, header.index("Recording Link") + 1)
-        assert link_cell.hyperlink.target == meera["audio_url"]  # Sarvam's signed link, not this server
+        assert got["Q1"]["Recording Link"] == meera["audio_url"]  # Sarvam's signed link, not this server
+        assert sorted(_csv_rows(_result(cid, "MISSED_CALLS"))) == ["Q2", "Q3"]  # busy twice, failed
     finally:
         object.__setattr__(settings, "public_base_url", original)
-
-
-def _campaign_for(mid):
-    return next(c for c in list_campaign_ids() if (load_campaign(c).get("email") or {}).get("message_id") == mid)
 
 
 def test_sarvam_outage_never_turns_real_results_into_a_wrong_final(monkeypatch):
     """Results can't be read for an hour: nothing is given up. Then the call isn't listed yet, so it goes
     to review and a final goes out. Then it turns up: the row is corrected and a corrected final follows."""
     from ams import results
-    from ams.config import settings
     from ams.sarvam import SarvamError
 
     original = settings.public_base_url
@@ -355,9 +257,7 @@ def test_sarvam_outage_never_turns_real_results_into_a_wrong_final(monkeypatch):
         def down(ids, since):
             raise SarvamError("Sarvam API 503: unavailable", retryable=True, status_code=503)
         monkeypatch.setattr(results, "fetch_attempts", down)
-        mid = _inject(_xlsx([["L1", "Lata", "9876500080", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]]), "late.xlsx")
-        mailer.poll_inbox()
-        cid = _campaign_for(mid)
+        cid = _upload(_xlsx([["L1", "Lata", "9876500080", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]]), "late.xlsx")
         _run_until(lambda: (load_campaign(cid)["rows"][0]["attempts"] or [{}])[-1].get("sarvam_attempt_id"))
         time.sleep(1)  # the call has finished at (mock) Sarvam
         with campaign_tx(cid) as camp:  # pretend it was placed an hour ago
@@ -370,14 +270,16 @@ def test_sarvam_outage_never_turns_real_results_into_a_wrong_final(monkeypatch):
         monkeypatch.setattr(results, "fetch_attempts", lambda ids, since: [])  # back, but not listing it yet
         _run_until(lambda: load_campaign(cid)["final_sent"])
         assert load_campaign(cid)["rows"][0]["status"] == "needs_review"
+        assert _csv_rows(_result(cid, "FINAL"))["L1"]["Call Status"] == "Result pending (under review)"
+        assert list(_csv_rows(_result(cid, "MISSED_CALLS"))) == ["L1"]
 
         monkeypatch.setattr(results, "fetch_attempts", real_fetch)  # the record turns up late
         _run_until(lambda: load_campaign(cid)["rows"][0]["status"] == "completed" and load_campaign(cid)["final_sent"])
-        finals = [e for e in load_campaign(cid)["emails"] if e["kind"] == "final"]
-        assert len(finals) == 2 and all(e["status"] == "sent" for e in finals)
-        corrected = [m for m in _outbox() if m["in_reply_to"] == mid][-1]
-        _, got = _rows(load_workbook(io.BytesIO(_attachment(corrected)))["Candidates"])
+        finals = [d for d in load_campaign(cid)["deliveries"] if d["kind"] == "final"]
+        assert len(finals) == 2 and all(d["status"] == "sent" for d in finals)
+        got = _csv_rows(_result(cid, "FINAL"))  # the corrected FINAL replaced the first one
         assert got["L1"]["Call Status"] == "Connected" and got["L1"]["Candidate Response"] == "Agreed to submit"
+        assert not _result(cid, "MISSED_CALLS").exists()  # reached after all: no longer a missed call
     finally:
         object.__setattr__(settings, "public_base_url", original)
 
@@ -388,9 +290,7 @@ def test_unconfirmed_call_goes_to_review_and_is_never_dialled_again(monkeypatch)
     def no_answer_from_sarvam(*args, **kwargs):
         raise SarvamError("Sarvam didn't answer in 30 s", retryable=False, uncertain=True)
     monkeypatch.setattr(scheduler, "place_call", no_answer_from_sarvam)
-    mid = _inject(_xlsx([["U1", "Uma", "9876500090", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]]), "unconfirmed.xlsx")
-    mailer.poll_inbox()
-    cid = _campaign_for(mid)
+    cid = _upload(_xlsx([["U1", "Uma", "9876500090", "ABC", "PAN", "18-11-2026", "", "NOW", "", ""]]), "unconfirmed.xlsx")
     scheduler.place_due_calls()
     scheduler.place_due_calls()
     row = load_campaign(cid)["rows"][0]
@@ -402,9 +302,8 @@ def test_an_earlier_attempt_that_connected_wins_over_a_later_miss():
     from ams.campaigns import apply_result
 
     later = (datetime.now(LOCAL_TZ) + timedelta(hours=3)).strftime("%d-%m-%Y")
-    mid = _inject(_xlsx([["E9", "Esha", "9876500095", "ABC", "PAN", "18-11-2026", later, "11:00 AM", "", ""]]), "earlier.xlsx")
-    mailer.poll_inbox()
-    cid = _campaign_for(mid)
+    cid = _upload(_xlsx([["E9", "Esha", "9876500095", "ABC", "PAN", "18-11-2026", later, "11:00 AM", "", ""]]),
+                  "earlier.xlsx")
     with campaign_tx(cid) as camp:  # attempt 1 got no result in time; "Call again" placed attempt 2
         row = camp["rows"][0]
         row["attempts"] = [
@@ -420,48 +319,48 @@ def test_an_earlier_attempt_that_connected_wins_over_a_later_miss():
     assert row["status"] == "completed" and row["outcome"]["disposition_call_disposition"] == "agreed_to_submit"
 
 
-def test_email_cut_off_mid_send_is_retried():
+def test_a_file_write_cut_off_by_a_restart_is_done_again():
     later = (datetime.now(LOCAL_TZ) + timedelta(hours=3)).strftime("%d-%m-%Y")
-    mid = _inject(_xlsx([["S1", "Sana", "9876500096", "ABC", "PAN", "18-11-2026", later, "11:00 AM", "", ""]]), "stuck.xlsx")
-    mailer.poll_inbox()
-    cid = _campaign_for(mid)
-    scheduler.run_cycle()  # ack
-    with campaign_tx(cid) as camp:  # an update was being sent when the server restarted
-        camp["emails"].append({"key": "update-7", "kind": "update", "update_no": 7, "status": "sending", "failures": 0,
-                               "created_at": iso(utcnow() - timedelta(minutes=30)),
-                               "sending_at": iso(utcnow() - timedelta(minutes=30))})
-    mailer.send_due_emails()
-    rec = next(e for e in load_campaign(cid)["emails"] if e["key"] == "update-7")
-    assert rec["status"] == "sent" and rec["failures"] == 1
-    assert any("Update-7" in a["name"] for m in _outbox() if m["in_reply_to"] == mid for a in m["attachments"])
+    cid = _upload(_xlsx([["S1", "Sana", "9876500096", "ABC", "PAN", "18-11-2026", later, "11:00 AM", "", ""]]),
+                  "stuck.xlsx")
+    scheduler.run_cycle()  # the "received" file
+    with campaign_tx(cid) as camp:  # an update was being written when the server restarted
+        camp["deliveries"].append({"key": "update-7", "kind": "update", "update_no": 7, "status": "sending",
+                                   "failures": 0, "created_at": iso(utcnow() - timedelta(minutes=30)),
+                                   "sending_at": iso(utcnow() - timedelta(minutes=30))})
+    outbox.send_due_results()
+    rec = next(d for d in load_campaign(cid)["deliveries"] if d["key"] == "update-7")
+    assert rec["status"] == "sent" and rec["failures"] == 1 and "Update-7" in rec["file"]
+    assert _result(cid, "RESULTS").exists()
 
 
 def test_a_final_composed_before_call_again_does_not_close_the_campaign():
     from ams.campaigns import row_action
 
-    cid = next(c for c in list_campaign_ids() if load_campaign(c)["final_sent"]
+    cid = next(c for c in list_campaign_ids() if load_campaign(c)["final_sent"] and load_campaign(c).get("drop")
                and any(r["status"] == "failed" for r in load_campaign(c)["rows"]))
-    with campaign_tx(cid) as camp:  # pretend the final was still on its way...
+    with campaign_tx(cid) as camp:  # pretend the final was still being written...
         camp["final_sent"] = False
-        camp["emails"].append({"key": "final-9", "kind": "final", "status": "sending", "failures": 0,
-                               "created_at": iso(utcnow()), "sending_at": mailer.stamp()})
-        index = len(camp["emails"]) - 1
+        camp["deliveries"].append({"key": "final-9", "kind": "final", "status": "sending", "failures": 0,
+                                   "created_at": iso(utcnow()), "sending_at": stamp()})
+        index = len(camp["deliveries"]) - 1
     row = next(r for r in load_campaign(cid)["rows"] if r["status"] == "failed")
     row_action(cid, row["row_id"], "call_again")  # ...when the operator pressed Call again
-    mailer._send_one(cid, index)
+    outbox._send_one(cid, index)
     camp = load_campaign(cid)
-    assert camp["emails"][index]["status"] == "sent" and not camp["final_sent"]  # a new final is still owed
+    assert camp["deliveries"][index]["status"] == "sent" and not camp["final_sent"]  # a new final is still owed
     _run_until(lambda: load_campaign(cid)["final_sent"])
 
 
-def test_call_again_after_final_sends_a_new_final():
+def test_call_again_after_final_writes_a_new_final():
     from ams.campaigns import row_action
-    cid = next(c for c in list_campaign_ids() if load_campaign(c)["final_sent"]
+
+    cid = next(c for c in list_campaign_ids() if load_campaign(c)["final_sent"] and load_campaign(c).get("drop")
                and any(r["status"] == "not_reachable" for r in load_campaign(c)["rows"]))
     row = next(r for r in load_campaign(cid)["rows"] if r["status"] == "not_reachable")
-    finals_before = sum(1 for e in load_campaign(cid)["emails"] if e["kind"] == "final")
+    finals_before = sum(1 for d in load_campaign(cid)["deliveries"] if d["kind"] == "final")
     assert "queued" in row_action(cid, row["row_id"], "call_again")
     assert not (campaign_dir(cid) / ".done").exists()
     _run_until(lambda: load_campaign(cid)["final_sent"])
-    finals = [e for e in load_campaign(cid)["emails"] if e["kind"] == "final"]
+    finals = [d for d in load_campaign(cid)["deliveries"] if d["kind"] == "final"]
     assert len(finals) == finals_before + 1 and finals[-1]["status"] == "sent"

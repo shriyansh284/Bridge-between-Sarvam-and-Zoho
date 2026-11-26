@@ -8,3 +8,5 @@ __pycache__/
 .pytest_cache/
 .env.*
 !.env.example
+# guides for the server administrator: shared directly, never committed
+sysadmin/

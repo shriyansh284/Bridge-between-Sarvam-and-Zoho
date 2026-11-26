@@ -2,11 +2,12 @@
 File-based storage (no database).
 
 data/
-  campaigns/<CAMPAIGN_ID>/campaign.json   all rows, attempts, results, email history
-  campaigns/<CAMPAIGN_ID>/input.xlsx      the client's original attachment
-  campaigns/<CAMPAIGN_ID>/outputs/        every result Excel that was emailed
-  state/status.json                       heartbeats, last mail check, last webhook
-  state/mail_log.jsonl                    every inbox email seen and what happened to it
+  campaigns/<CAMPAIGN_ID>/campaign.json   all rows, attempts, results, result files written
+  campaigns/<CAMPAIGN_ID>/input.csv       the client's original file
+  campaigns/<CAMPAIGN_ID>/outputs/        a copy of every result file written to the SFTP folder
+  state/status.json                       heartbeats, last SFTP folder check, last call result
+  state/file_log.jsonl                    every file picked up from the SFTP folder and what happened to it
+  state/drop_files.json                   pickups in progress (makes them restart-safe)
   state/counter.json                      campaign number sequence
   locks/                                  lock files (several processes share these files)
 
@@ -94,7 +95,10 @@ def campaign_path(cid: str) -> Path:
 
 
 def load_campaign(cid: str) -> Optional[dict]:
-    return read_json(campaign_path(cid))
+    camp = read_json(campaign_path(cid))
+    if camp is not None and "deliveries" not in camp:  # saved by the earlier email version
+        camp["deliveries"] = camp.pop("emails", [])
+    return camp
 
 
 def save_campaign(camp: dict) -> None:

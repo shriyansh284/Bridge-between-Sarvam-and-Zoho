@@ -1,6 +1,6 @@
 """
 All settings come from environment variables or a .env file in the project root.
-Secrets (Sarvam API key, Zoho client secret / refresh token) live only here.
+Secrets (the Sarvam API key) live only here.
 """
 from __future__ import annotations
 
@@ -30,17 +30,9 @@ def _int(name: str, default: int) -> int:
     return int(_get(name, default))
 
 
-def _bool(name: str, default: bool) -> bool:
-    return str(_get(name, default)).lower() in ("1", "true", "yes", "on")
-
-
 def _time(name: str, default: str) -> time:
     h, m = str(_get(name, default)).split(":")
     return time(int(h), int(m))
-
-
-def _list(name: str, default: str = "") -> tuple:
-    return tuple(x.strip().lower() for x in str(_get(name, default)).split(",") if x.strip())
 
 
 # Sarvam agent variable -> field read from the client's sheet.
@@ -53,7 +45,7 @@ DEFAULT_AGENT_VARIABLE_MAP = {
     "whatsapp_message_date": "whatsapp_message_date",
 }
 
-# Result column in the Excel -> key in the agent's final_agent_variables.
+# Result column in the result file -> key in the agent's final_agent_variables.
 # Matches agent Conversatio-3f6c465d-6251 (checked with `python -m ams.sarvam_setup check`).
 DEFAULT_RESULT_FIELD_MAP = {
     "Candidate Response": "disposition_call_disposition",
@@ -61,18 +53,6 @@ DEFAULT_RESULT_FIELD_MAP = {
     "Call Summary": "summary",
     "Call Quality": "call_conversation_quality",
 }
-
-_DC = {
-    "in": ("https://accounts.zoho.in", "https://mail.zoho.in"),
-    "com": ("https://accounts.zoho.com", "https://mail.zoho.com"),
-    "eu": ("https://accounts.zoho.eu", "https://mail.zoho.eu"),
-    "com.au": ("https://accounts.zoho.com.au", "https://mail.zoho.com.au"),
-    "jp": ("https://accounts.zoho.jp", "https://mail.zoho.jp"),
-    "ca": ("https://accounts.zohocloud.ca", "https://mail.zohocloud.ca"),
-    "sa": ("https://accounts.zoho.sa", "https://mail.zoho.sa"),
-}
-_zoho_dc = _get("ZOHO_DC", "in")
-
 
 @dataclass(frozen=True)
 class Settings:
@@ -88,28 +68,10 @@ class Settings:
     sarvam_analytics_base: str = _get("SARVAM_ANALYTICS_BASE", "https://apps.sarvam.ai/api/analytics")
     sarvam_phone_format: str = _get("SARVAM_PHONE_FORMAT", "e164")  # e164 | digits | national
 
-    # --- Zoho Mail ------------------------------------------------------
-    zoho_client_id: str = _get("ZOHO_CLIENT_ID", "")
-    zoho_client_secret: str = _get("ZOHO_CLIENT_SECRET", "")
-    zoho_refresh_token: str = _get("ZOHO_REFRESH_TOKEN", "")
-    zoho_redirect_uri: str = _get("ZOHO_REDIRECT_URI", "")      # only for a Server-based client (blank = Self Client)
-    zoho_accounts_url: str = _get("ZOHO_ACCOUNTS_URL", _DC.get(_zoho_dc, _DC["in"])[0])
-    zoho_mail_api_url: str = _get("ZOHO_MAIL_API_URL", _DC.get(_zoho_dc, _DC["in"])[1])
-    zoho_account_id: str = _get("ZOHO_ACCOUNT_ID", "")         # blank = discover automatically
-    # ZOHO_FROM_ADDRESS, ALLOWED_SENDERS and REPLY_CC are starting values; the dashboard's
-    # Email settings tab can change them later (read them through ams/email_settings.py)
-    zoho_from_address: str = _get("ZOHO_FROM_ADDRESS", "")     # the fixed address clients write to
-    zoho_folder: str = _get("ZOHO_FOLDER", "Inbox")
-    mail_poll_seconds: int = _int("MAIL_POLL_SECONDS", 60)
-    mail_enabled: bool = _bool("MAIL_ENABLED", True)
-    allowed_senders: tuple = _list("ALLOWED_SENDERS")           # emails or @domain.com; blank = anyone
-    cc_addresses: str = _get("REPLY_CC", "")                    # internal copy of every reply
-    send_ack: bool = _bool("SEND_ACK", True)
-    duplicate_file_days: int = _int("DUPLICATE_FILE_DAYS", 7)
-
-    # --- Client file drop over SFTP (OPTIONAL; ams/dropfolder.py) ---------
-    # The client uploads files into DROP_DIR/inbox; results are written to DROP_DIR/results instead of
-    # being emailed. deploy/setup_sftp.sh creates the folder and the client's SFTP login. Blank = off.
+    # --- Client SFTP folder (ams/dropfolder.py) ---------------------------
+    # The client uploads files into DROP_DIR/inbox, the output sheets appear in DROP_DIR/send, and missed
+    # calls (and files that can't be used) in DROP_DIR/failed.
+    # deploy/setup_sftp.sh creates the folder and the client's SFTP login, and sets DROP_DIR.
     drop_dir: str = _get("DROP_DIR", "")
     drop_poll_seconds: int = _int("DROP_POLL_SECONDS", 30)
     drop_settle_seconds: int = _int("DROP_SETTLE_SECONDS", 60)   # a file must be unchanged this long (upload done)
@@ -117,10 +79,11 @@ class Settings:
     # Each file's own dates show their order (25/11 or 11/25); this decides only when every date in a file reads
     # either way (05/11/2026): dmy = day first (the template) | mdy = month first (the client's form).
     drop_date_order: str = _get("DROP_DATE_ORDER", "dmy").lower()
+    duplicate_file_days: int = _int("DUPLICATE_FILE_DAYS", 7)   # the same file / booking isn't called twice
 
     # --- Public URLs (OPTIONAL) -----------------------------------------
     # Without a public address the app fetches each call's result from Sarvam every RESULT_POLL_SECONDS,
-    # and recording links in the Excel point at Sarvam's own signed links. With one, Sarvam also posts
+    # and recording links in the result files point at Sarvam's own signed links. With one, Sarvam also posts
     # results to our webhook straight away and recording links go through this server.
     public_base_url: str = _get("PUBLIC_BASE_URL", "")          # where server.py is reachable over HTTPS
     webhook_secret: str = _get("WEBHOOK_SECRET", "")
@@ -146,10 +109,10 @@ class Settings:
     scheduler_poll_seconds: int = _int("SCHEDULER_POLL_SECONDS", 20)
     past_time_grace_hours: int = _int("PAST_TIME_GRACE_HOURS", 24)
 
-    # --- Result emails --------------------------------------------------
+    # --- Result files ---------------------------------------------------
     batch_mode: str = _get("BATCH_MODE", "slot")    # slot | size | final
     batch_size: int = _int("BATCH_SIZE", 10)
-    max_email_failures: int = _int("MAX_EMAIL_FAILURES", 5)
+    max_delivery_failures: int = _int("MAX_DELIVERY_FAILURES", 5)
 
     # --- Mapping --------------------------------------------------------
     agent_variable_map: dict = field(
@@ -174,15 +137,6 @@ class Settings:
             "SARVAM_CONNECTION_ID": self.sarvam_connection_id,
             "SARVAM_AGENT_PHONE_NUMBER": self.sarvam_agent_phone_number,
         }  # PUBLIC_BASE_URL is optional: results are fetched from Sarvam when there is none
-        return [k for k, v in need.items() if not v]
-
-    def missing_for_mail(self) -> list[str]:
-        from .email_settings import mailbox  # the address can also be set in the dashboard
-
-        need = {
-            "ZOHO_CLIENT_ID": self.zoho_client_id, "ZOHO_CLIENT_SECRET": self.zoho_client_secret,
-            "ZOHO_REFRESH_TOKEN": self.zoho_refresh_token, "ZOHO_FROM_ADDRESS": mailbox(),
-        }
         return [k for k, v in need.items() if not v]
 
     def dashboard_users(self) -> dict:

@@ -70,7 +70,7 @@ CLIENT_FORMAT = [
     ("Pending Documents", "Yes", "Documents still pending, separated by commas.", "PAN Card, Graduation Certificate"),
     ("WhatsApp Message Date", "Yes", "Date the WhatsApp reminder was sent, DD-MM-YYYY.", "18-11-2026"),
     ("Call Date", "Yes", "Date to call, DD-MM-YYYY. Can be empty when Call Time is NOW.", "20-11-2026"),
-    ("Call Time", "Yes", "India time, e.g. 10:30 AM or 16:00. Write NOW to call as soon as the email arrives.",
+    ("Call Time", "Yes", "India time, e.g. 10:30 AM or 16:00. Write NOW to call as soon as the file arrives.",
      "10:30 AM"),
 ]
 TEMPLATE_HEADERS = [column for column, *_ in CLIENT_FORMAT]

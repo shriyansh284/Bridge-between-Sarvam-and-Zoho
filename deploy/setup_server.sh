@@ -5,26 +5,56 @@
 #   curl -fsSL https://raw.githubusercontent.com/shriyansh284/Bridge-between-Sarvam-and-Zoho/main/deploy/setup_server.sh -o setup_server.sh
 #   sudo bash setup_server.sh
 #
-# No domain, no HTTPS certificate and no open inbound ports are needed: the app only makes
-# outgoing connections (Zoho Mail, Sarvam) and fetches each call's result from Sarvam itself.
+# Options (environment variables; a later run keeps the values chosen the first time):
+#   APP_DIR=/opt/ams-calling        where the app is installed
+#   APP_USER=ams                    the system account it runs as (not a person's login)
+#   BACKEND_PORT=8000               local port of the backend (127.0.0.1 only)
+#   DASHBOARD_PORT=8501             local port of the dashboard (127.0.0.1 only)
+#   BACKUP_DIR=/var/backups/ams-calling  BACKUP_DAYS=14   daily backup of data/ and how long to keep it
+#   REPO_URL=... BRANCH=main        where the code comes from
+#   e.g. on a server shared with other projects:
+#   sudo APP_DIR=/backend/ams-calling BACKEND_PORT=8710 DASHBOARD_PORT=8711 bash setup_server.sh
+#
+# The step-by-step manual version of everything below is in the deployment guide (DEPLOYMENT.md).
+#
+# No domain and no HTTPS certificate are needed: the app only makes outgoing connections to Sarvam and
+# fetches each call's result itself. The client's SFTP folder is set up next, with setup_sftp.sh.
 #
 # It installs Python, puts the app in /opt/ams-calling, runs it as two systemd services
 # (backend + internal dashboard, both on 127.0.0.1 only), adds a daily backup of data/, and
-# checks Sarvam and Zoho at the end.
+# checks the Sarvam settings at the end.
 #
 # Updating later: download this script again and run it the same way (always run a fresh copy you
 # downloaded, never the one inside /opt/ams-calling, which the app's account can modify).
 # It never deletes data/ and never changes .env.
 set -euo pipefail
 
-APP_DIR=/opt/ams-calling
+UNIT_DIR=/etc/systemd/system
+BACKUP_SCRIPT=/usr/local/sbin/ams-calling-backup
+# Choices made on the first run are read back from the installed files, so a later run keeps them.
+unit_port() { [ -f "$UNIT_DIR/$1.service" ] && sed -n "s/.*$2 \([0-9][0-9]*\).*/\1/p" "$UNIT_DIR/$1.service" || true; }
+unit_get()  { [ -f "$UNIT_DIR/$1.service" ] && sed -n "s/^$2=//p" "$UNIT_DIR/$1.service" || true; }
+backup_get() { [ -f "$BACKUP_SCRIPT" ] && sed -n "s/^$1=//p" "$BACKUP_SCRIPT" || true; }
+APP_DIR=${APP_DIR:-$(unit_get ams-backend WorkingDirectory)}
+APP_DIR=${APP_DIR:-/opt/ams-calling}
+APP_DIR=${APP_DIR%/}
+APP_USER=${APP_USER:-$(unit_get ams-backend User)}
 APP_USER=${APP_USER:-ams}
 APP_HOME=/var/lib/$APP_USER
+BACKEND_PORT=${BACKEND_PORT:-$(unit_port ams-backend ' --port')}
+BACKEND_PORT=${BACKEND_PORT:-8000}
+DASHBOARD_PORT=${DASHBOARD_PORT:-$(unit_port ams-dashboard '--server.port')}
+DASHBOARD_PORT=${DASHBOARD_PORT:-8501}
+BACKUP_DIR=${BACKUP_DIR:-$(backup_get BACKUP_DIR)}
+BACKUP_DIR=${BACKUP_DIR:-/var/backups/ams-calling}
+BACKUP_DIR=${BACKUP_DIR%/}
+BACKUP_DAYS=${BACKUP_DAYS:-$(backup_get KEEP_DAYS)}
+BACKUP_DAYS=${BACKUP_DAYS:-14}
 REPO_URL=${REPO_URL:-https://github.com/shriyansh284/Bridge-between-Sarvam-and-Zoho.git}
 BRANCH=${BRANCH:-main}
 ENV_FILE="$APP_DIR/.env"
 USERS_FILE="$APP_DIR/config/users.json"
-ONE_COPY="Only ONE copy of the backend may ever run with this .env. Stop it on any other machine (e.g. a developer PC) first: two copies read the same mailbox and call candidates twice."
+ONE_COPY="Only ONE copy of the backend may ever run with this .env. Stop it on any other machine (e.g. a developer PC) first: two copies working on the same campaigns call candidates twice."
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33mWARNING:\033[0m %s\n' "$*" >&2; }
@@ -32,8 +62,19 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 as_app() { runuser -u "$APP_USER" -- env HOME="$APP_HOME" "$@"; }
 
 [ "$(id -u)" -eq 0 ] || die "Run it with sudo:  sudo bash $0"
+for p in "$BACKEND_PORT" "$DASHBOARD_PORT"; do
+  [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1024 ] && [ "$p" -le 65535 ] || die "Ports must be numbers from 1024 to 65535 (got '$p')."
+done
+[ "$BACKEND_PORT" != "$DASHBOARD_PORT" ] || die "BACKEND_PORT and DASHBOARD_PORT must be different."
+for d in "$APP_DIR" "$BACKUP_DIR"; do
+  [[ "$d" =~ ^(/[A-Za-z0-9._-]+)+$ ]] || die "Folders must be full paths with letters, digits, . _ - only (got '$d')."
+  case "$d/" in */../*|*/./*|/etc/*|/usr/*|/bin/*|/sbin/*|/lib/*|/proc/*|/sys/*|/dev/*|/boot/*|/root/*|/run/*)
+    die "'$d' can't be used: choose a folder outside the system folders." ;; esac
+done
+[[ "$BACKUP_DAYS" =~ ^[0-9]+$ ]] && [ "$BACKUP_DAYS" -ge 1 ] || die "BACKUP_DAYS must be a number of days (got '$BACKUP_DAYS')."
+[[ "$APP_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "APP_USER '$APP_USER' isn't a valid account name."
 command -v apt-get >/dev/null && command -v systemctl >/dev/null \
-  || die "This script needs Ubuntu/Debian with systemd. Follow the manual steps in README.md (Step 7) instead."
+  || die "This script needs Ubuntu/Debian with systemd. Follow the manual steps in the deployment guide (DEPLOYMENT.md) instead."
 FIRST_INSTALL=1
 [ -f /etc/systemd/system/ams-backend.service ] && FIRST_INSTALL=0
 
@@ -79,11 +120,11 @@ else
     || die "Couldn't download the code from $REPO_URL. If the repository is private, ask the project owner for access."
   git -C "$APP_DIR" checkout -q -B "$BRANCH" --track "origin/$BRANCH"
 fi
-[ -f "$APP_DIR/ams/results.py" ] \
+[ -f "$APP_DIR/ams/outbox.py" ] \
   || die "The code on GitHub ($REPO_URL, branch $BRANCH) is an old version. Ask the project owner to push the latest code, then run again."
 
-# A new server must start with an EMPTY data/: data copied from another machine carries an old go-live
-# time, and then emails already sitting in the mailbox would start real calls.
+# A new server must start with an EMPTY data/: data copied from another machine carries that machine's
+# scheduled calls, so the same candidates would be called again from here.
 if [ "$FIRST_INSTALL" = 1 ] && [ -d "$APP_DIR/data" ] && [ -n "$(find "$APP_DIR/data" -type f -print -quit)" ] \
    && [ -z "${AMS_KEEP_DATA:-}" ]; then
   die "$APP_DIR/data already contains files (copied from another machine?). Move it away: sudo mv $APP_DIR/data $APP_DIR/data.copied
@@ -133,12 +174,13 @@ fi
 # ---------------------------------------------------------------- 5. services
 say "Installing the services"
 systemctl stop ams-backend ams-dashboard 2>/dev/null || true
-BUSY=$(ss -ltnH '( sport = :8000 or sport = :8501 )' 2>/dev/null || true)
-[ -z "$BUSY" ] || die "Port 8000 or 8501 is already used by another program on this server (the app needs both, on 127.0.0.1):
+BUSY=$(ss -ltnH "( sport = :$BACKEND_PORT or sport = :$DASHBOARD_PORT )" 2>/dev/null || true)
+[ -z "$BUSY" ] || die "Port $BACKEND_PORT or $DASHBOARD_PORT is already used by another program on this server (the app needs both, on 127.0.0.1).
+Pick two free ports and run again, e.g.:  sudo BACKEND_PORT=8710 DASHBOARD_PORT=8711 bash $0
 $BUSY"
 cat > /etc/systemd/system/ams-backend.service <<EOF
 [Unit]
-Description=AMS calling backend (inbox reader, call scheduler, result fetcher, result emails)
+Description=AMS calling backend (SFTP folder watcher, call scheduler, result fetcher, result files)
 After=network-online.target
 Wants=network-online.target
 
@@ -147,7 +189,7 @@ User=$APP_USER
 WorkingDirectory=$APP_DIR
 Environment=HOME=$APP_HOME PYTHONUNBUFFERED=1
 # ONE worker only: the app keeps its state in files; two copies would call candidates twice.
-ExecStart=$APP_DIR/venv/bin/uvicorn ams.server:app --host 127.0.0.1 --port 8000 --workers 1 --no-access-log
+ExecStart=$APP_DIR/venv/bin/uvicorn ams.server:app --host 127.0.0.1 --port $BACKEND_PORT --workers 1 --no-access-log
 Restart=always
 RestartSec=5
 UMask=0027
@@ -167,7 +209,7 @@ Wants=network-online.target
 User=$APP_USER
 WorkingDirectory=$APP_DIR
 Environment=HOME=$APP_HOME PYTHONUNBUFFERED=1
-ExecStart=$APP_DIR/venv/bin/streamlit run dashboard.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --server.fileWatcherType none --browser.gatherUsageStats false
+ExecStart=$APP_DIR/venv/bin/streamlit run dashboard.py --server.address 127.0.0.1 --server.port $DASHBOARD_PORT --server.headless true --server.fileWatcherType none --browser.gatherUsageStats false
 Restart=always
 RestartSec=5
 UMask=0027
@@ -179,23 +221,26 @@ WantedBy=multi-user.target
 EOF
 
 # ---------------------------------------------------------------- 6. daily backup of data/ (systemd timer: no cron needed)
-cat > /usr/local/sbin/ams-calling-backup <<EOF
+cat > "$BACKUP_SCRIPT" <<EOF
 #!/bin/sh
-# Daily copy of the AMS calling data (campaigns, results, emails); keeps 14 days.
+# Daily copy of the AMS calling data (campaigns, call results, result files).
 set -e
+APP_DIR=$APP_DIR
+BACKUP_DIR=$BACKUP_DIR
+KEEP_DAYS=$BACKUP_DAYS
 umask 077
-mkdir -p /var/backups/ams-calling
-tar -czf "/var/backups/ams-calling/data-\$(date +%F).tar.gz" -C $APP_DIR data
-find /var/backups/ams-calling -name 'data-*.tar.gz' -mtime +14 -delete
+mkdir -p "\$BACKUP_DIR"
+tar -czf "\$BACKUP_DIR/data-\$(date +%F).tar.gz" -C "\$APP_DIR" data
+find "\$BACKUP_DIR" -name 'data-*.tar.gz' -mtime +"\$KEEP_DAYS" -delete
 EOF
-chmod 755 /usr/local/sbin/ams-calling-backup
+chmod 755 "$BACKUP_SCRIPT"
 cat > /etc/systemd/system/ams-calling-backup.service <<EOF
 [Unit]
 Description=Back up the AMS calling data folder
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/ams-calling-backup
+ExecStart=$BACKUP_SCRIPT
 EOF
 cat > /etc/systemd/system/ams-calling-backup.timer <<EOF
 [Unit]
@@ -220,8 +265,8 @@ systemctl restart ams-backend ams-dashboard
 say "Checking the app"
 FAILED=0
 ok=0
-for _ in $(seq 1 30); do   # the answer must be THIS app's health check, not another program on port 8000
-  health=$(curl -fsS --max-time 5 http://127.0.0.1:8000/health 2>/dev/null || true)
+for _ in $(seq 1 30); do   # the answer must be THIS app's health check, not another program on the port
+  health=$(curl -fsS --max-time 5 "http://127.0.0.1:$BACKEND_PORT/health" 2>/dev/null || true)
   case "$health" in *scheduler_heartbeat*) ok=1; break ;; esac
   sleep 1
 done
@@ -233,7 +278,7 @@ if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)
 fi
 
 cd "$APP_DIR"
-for tool in sarvam_setup zoho_setup; do   # read-only checks of the Sarvam key/IDs and the Zoho mailbox/folder
+for tool in sarvam_setup; do   # read-only check of the Sarvam key, IDs and agent
   rc=0
   out=$(as_app "$APP_DIR/venv/bin/python" -m "ams.$tool" check 2>&1) || rc=$?
   echo; echo "${tool%_setup}:"
@@ -248,16 +293,17 @@ done
 
 say "Summary"
 cat <<EOF
-The app is running. It needs no public address: it reads the mailbox, places the calls,
-fetches each result from Sarvam and emails the result file back, all by itself.
+The app is running. It needs no public address: it places the calls and fetches each
+result from Sarvam by itself. Next, set up the client's SFTP folder (below).
 
-Dashboard : from your PC run   ssh -L 8501:127.0.0.1:8501 <user>@<this-server>
-            then open          http://localhost:8501
-Status    : curl -s http://127.0.0.1:8000/health
+Dashboard : from your PC run   ssh -L $DASHBOARD_PORT:127.0.0.1:$DASHBOARD_PORT <user>@<this-server>
+            then open          http://localhost:$DASHBOARD_PORT
+Status    : curl -s http://127.0.0.1:$BACKEND_PORT/health
 Logs      : journalctl -u ams-backend -f        (dashboard: -u ams-dashboard)
 Update    : download this script again and run it:  sudo bash setup_server.sh
-Backups   : /var/backups/ams-calling (daily, kept 14 days)
-Client SFTP folder (optional): sudo CLIENT_IPS=<client IP> bash setup_sftp.sh  (see DEVOPS_DEPLOYMENT.md)
+Installed : $APP_DIR  (runs as $APP_USER; backend 127.0.0.1:$BACKEND_PORT, dashboard 127.0.0.1:$DASHBOARD_PORT)
+Backups   : $BACKUP_DIR (daily, kept $BACKUP_DAYS days)
+SFTP folder: sudo DROP_DIR=<folder> CLIENT_IPS=<client IP> bash setup_sftp.sh  (see the SFTP setup guide, SFTP_SETUP.md)
 
 $ONE_COPY
 EOF

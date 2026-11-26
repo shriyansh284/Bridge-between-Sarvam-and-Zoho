@@ -11,7 +11,7 @@ Routes
 No public address is needed: without one, results are fetched from Sarvam (ams/results.py) and
 recording links in the Excel are Sarvam's own signed links. Bind to 127.0.0.1 in that case.
 
-It also runs the scheduler and the inbox reader in background threads
+It also runs the scheduler and the SFTP folder watcher in background threads
 (set BACKGROUND_IN_SERVER=false to run `python -m ams.scheduler` separately).
 """
 from __future__ import annotations
@@ -101,6 +101,5 @@ async def recording(token: str):
 async def health():
     status = get_status()
     return {"ok": True, "scheduler_heartbeat": status.get("scheduler_heartbeat"),
-            "mail_last_check": status.get("mail_last_check"), "last_webhook": status.get("last_webhook"),
-            "result_poll": status.get("result_poll"), "calls_paused": status.get("calls_paused"),
-            "drop_last_check": status.get("drop_last_check") if settings.drop_dir else None}
+            "drop_last_check": status.get("drop_last_check"), "last_webhook": status.get("last_webhook"),
+            "result_poll": status.get("result_poll"), "calls_paused": status.get("calls_paused")}

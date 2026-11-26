@@ -46,16 +46,16 @@ def write_xlsx() -> None:
 
     guide = wb.create_sheet("How to fill")
     guide.append(["Fill the Candidates sheet: one candidate per row, starting at row 2. "
-                  "Keep the column names as they are, then email the file to the AMS calling address."])
+                  "Keep the column names as they are, save it, then upload it to the inbox folder of your AMS SFTP login."])
     guide.append([])
     guide.append(["Column", "Required", "What to write", "Example"])
     for column, required, rule, example in CLIENT_FORMAT:
         guide.append([column, required, rule, example])
     guide.append([])
     guide.append(["How results come back"])
-    guide.append(["You get a reply in the same email thread when the file is received, an updated file each time "
-                  "a call time (Call Date + Call Time) finishes, and a FINAL file when every call is done. "
-                  "Your columns stay as sent; result columns are added on the right."])
+    guide.append(["A results file appears in the results folder as soon as the file is picked up, is updated each "
+                  "time a call time (Call Date + Call Time) finishes, and becomes the FINAL file when every call is "
+                  "done. Your columns stay as sent; result columns are added on the right."])
     for cell in guide[3]:
         cell.font = Font(name="Arial", bold=True, color="FFFFFF")
         cell.fill = HEAD_FILL

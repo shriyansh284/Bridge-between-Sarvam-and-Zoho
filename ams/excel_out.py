@@ -200,9 +200,45 @@ def _summary_sheet(wb, camp: dict, final: bool) -> None:
     ws.column_dimensions["B"].width = 60
 
 
-def build_results_csv(camp: dict) -> bytes:
+def build_results_csv(camp: dict, statuses: Optional[set] = None) -> bytes:
     """The same result columns as build_results, as a CSV (for the SFTP folder, where the client's
-    system reads the file). The client's own columns come first, unchanged; links are plain URLs."""
+    system reads the file). The client's own columns come first, unchanged; links are plain URLs.
+    `statuses`: only the rows in these states (e.g. the missed-calls sheet)."""
+    headers, lines = result_table(camp, statuses)
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(headers)
+    writer.writerows(lines)
+    return buf.getvalue().encode("utf-8-sig")  # with a BOM, so Excel shows Indian names correctly
+
+
+def build_table_xlsx(headers: list[str], lines: list[list[str]], title: str) -> bytes:
+    """A plain workbook from result_table (the missed-calls sheet in Excel form)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = title[:31]
+    ws.append(headers)
+    result_names = set(result_columns())
+    for cell in ws[1]:
+        _style_header(cell, result=cell.value in result_names)
+    for line in lines:
+        ws.append(line)
+    if "Recording Link" in headers:
+        col = headers.index("Recording Link") + 1
+        for (cell,) in ws.iter_rows(min_row=2, min_col=col, max_col=col):
+            if cell.value:
+                cell.hyperlink, cell.value = cell.value, "Listen"
+                cell.font = Font(name="Arial", size=10, color="0563C1", underline="single")
+    for i, name in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = {"Transcript": 70, "Call Summary": 50}.get(name, 22)
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def result_table(camp: dict, statuses: Optional[set] = None) -> tuple[list[str], list[list[str]]]:
+    """(header, rows) of the result sheet as text: the client's columns, then the result columns."""
     path = campaign_dir(camp["campaign_id"]) / camp["input_file"]
     sheet = read_sheet(path.read_bytes(), camp["file_name"])
     width = max((i + 1 for i, h in enumerate(sheet.headers) if h), default=0)  # drop empty trailing columns
@@ -216,19 +252,19 @@ def build_results_csv(camp: dict) -> bytes:
             col_for[name] = len(headers) - 1
 
     by_row = {r["excel_row"]: r for r in camp["rows"]}
-    buf = io.StringIO()
-    writer = csv.writer(buf, lineterminator="\r\n")
-    writer.writerow(headers)
+    lines = []
     for excel_row, cells in sheet.rows:
+        row = by_row.get(excel_row)
+        if statuses is not None and (not row or row["status"] not in statuses):
+            continue
         # text stays exactly as sent; Excel numbers and dates are written the way the sheet reads them
         line = [c if isinstance(c, str) else clean(c) for c in list(cells[:width]) + [None] * (width - len(cells[:width]))]
         line += [""] * (len(headers) - len(line))
-        row = by_row.get(excel_row)
         if row:
             for name, value in result_values(camp, row).items():
                 line[col_for[name]] = "" if value is None else str(value)
-        writer.writerow(line)
-    return buf.getvalue().encode("utf-8-sig")  # with a BOM, so Excel shows Indian names correctly
+        lines.append(line)
+    return headers, lines
 
 
 def output_name(camp: dict, kind: str, update_no: Optional[int] = None, ext: str = "xlsx") -> str:

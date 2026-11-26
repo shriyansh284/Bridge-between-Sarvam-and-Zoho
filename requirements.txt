@@ -7,7 +7,6 @@ filelock>=3.13
 python-dotenv>=1.0
 streamlit>=1.50
 # xlrd>=2.0            # only if clients send old .xls files
-# tests / local mocks
+# tests / local mock of Sarvam
 httpx>=0.27
-python-multipart>=0.0.9
 pytest>=8.0

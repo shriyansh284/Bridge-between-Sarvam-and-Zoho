@@ -1,23 +1,24 @@
 """
-Client file drop over SFTP: the client's system uploads candidate files, and collects the results, in a
-folder on this server instead of using email. deploy/setup_sftp.sh creates the folder and the client's
-SFTP login (which can see nothing else on the server). Set DROP_DIR in .env to turn it on.
+The client's SFTP folder: the client's system uploads candidate files, and collects the results, in a folder on
+this server. deploy/setup_sftp.sh creates the folder and the client's SFTP login (which can see nothing else on
+the server) and sets DROP_DIR in .env.
 
 DROP_DIR/
-  inbox/      the client uploads files here (.csv or .xlsx, the same template as by email)
-  processed/  a file moves here as soon as it's picked up and its campaign is created
-  results/    <file>_<campaign>_RESULTS.csv right away (the schedule, and rows that can't be called), replaced
-              after every finished call time, then <file>_<campaign>_FINAL.csv once every call is done
-  errors/     files that can't be used are moved here, each with a note (<file name>_ERROR.txt) saying what to fix
+  inbox/   the client uploads files here (.csv or .xlsx, with a header row). A file leaves the inbox as soon as
+           it's picked up (the original is kept in data/campaigns/<campaign>/).
+  send/    the output sheet: <file>_<campaign>_RESULTS.csv right away (the schedule), replaced after every
+           finished call time, then <file>_<campaign>_FINAL.csv once every call is done
+  failed/  <file>_<campaign>_MISSED_CALLS.csv: every candidate not reached (no answer, busy, failed, not called),
+           kept up to date; and files that can't be used, each with a note (<file name>_ERROR.txt)
 
 poll_drop() runs every DROP_POLL_SECONDS. A file is read only once it has stopped changing for
 DROP_SETTLE_SECONDS, so a file still being uploaded is never read half-way, and names upload tools use while
 uploading (.filepart, .part, .tmp, names starting with a dot) are skipped. Every file this app writes appears
 under its final name in one step: it is written under a hidden temporary name first, then renamed.
 
-Crash safety: each pickup is recorded in data/state/drop_files.json before the file is moved, and the campaign
-keeps that record's id, so a restart at any point finishes the pickup without ever creating the campaign (and
-calling its candidates) twice.
+Crash safety: each pickup is recorded in data/state/drop_files.json, then the file is claimed by renaming it to a
+hidden name in the inbox (.picked-...), and the campaign keeps the record's id. A restart at any point finishes the
+pickup without ever creating the campaign (and calling its candidates) twice.
 """
 from __future__ import annotations
 
@@ -32,20 +33,22 @@ from typing import Optional
 
 from filelock import Timeout
 
-from .campaigns import counts, create_campaign, file_sha, find_drop_campaign, find_duplicate_drop
+from .campaigns import NOT_CONNECTED, counts, create_campaign, file_sha, find_drop_campaign, find_duplicate_drop
 from .config import settings
-from .excel_out import build_results, build_results_csv, output_name
+from .excel_out import build_results, build_results_csv, build_table_xlsx, output_name, result_table
 from .sheet import CLIENT_FORMAT, SheetError
 from .store import STATE, _windows_retry, append_log, campaign_dir, lock, read_json, set_status, write_json
 from .timeutil import fmt_local, iso, to_local, utcnow
 
 log = logging.getLogger(__name__)
-FOLDERS = ("inbox", "processed", "results", "errors")
+INBOX, SEND, FAILED = "inbox", "send", "failed"
+FOLDERS = (INBOX, SEND, FAILED)
+PICKED = ".picked-"  # a claimed file's hidden name in the inbox, while its campaign is being created
 SPREADSHEET_EXT = (".xlsx", ".xlsm", ".xls", ".csv")
 TEMP_SUFFIXES = (".filepart", ".part", ".partial", ".tmp", ".temp", ".crdownload", ".upload", ".uploading")
 MAX_FILE_BYTES = 25 * 1024 * 1024
 CLAIMS = STATE / "drop_files.json"
-SOURCE = "SFTP upload"  # how drop files appear in the Inbox log
+SOURCE = "SFTP upload"  # how uploads appear in the dashboard's File log
 
 
 class DropError(Exception):
@@ -193,7 +196,7 @@ def poll_drop() -> dict:
 def _scan_inbox(stats: dict, errors: list[str]) -> None:
     now = time.time()
     entries = []
-    for path in folder("inbox").iterdir():
+    for path in folder(INBOX).iterdir():
         if _ignored(path.name):
             continue
         try:
@@ -218,10 +221,10 @@ def _scan_inbox(stats: dict, errors: list[str]) -> None:
 
 def _pick_up(path: Path) -> str:
     claim_id = uuid.uuid4().hex
-    claimed_as = _free_name(folder("processed"), path.name)
+    claimed_as = f"{PICKED}{claim_id[:12]}-{path.name}"  # hidden: never picked up a second time
     _record(claim_id, file=path.name, claimed_as=claimed_as, status="claiming", at=iso(utcnow()))
     try:
-        os.rename(path, folder("processed") / claimed_as)  # same folder tree, so the move is one step
+        os.rename(path, folder(INBOX) / claimed_as)  # same folder, so the rename is one step
     except FileNotFoundError:  # the client removed it again
         data = _claims()
         data.pop(claim_id, None)
@@ -234,8 +237,8 @@ def _pick_up(path: Path) -> str:
 def _resume(claim_id: str) -> Optional[str]:
     rec = _claims()[claim_id]
     if rec["status"] == "claiming":
-        if not os.path.lexists(folder("processed") / rec["claimed_as"]):
-            data = _claims()  # never moved: it's still in the inbox and is picked up normally
+        if not os.path.lexists(folder(INBOX) / rec["claimed_as"]):
+            data = _claims()  # never renamed: still in the inbox under its own name, picked up normally
             data.pop(claim_id, None)
             write_json(CLAIMS, data)
             return None
@@ -247,17 +250,18 @@ def _resume(claim_id: str) -> Optional[str]:
 
 def _finish(claim_id: str) -> str:
     rec = _claims()[claim_id]
+    src = folder(INBOX) / rec["claimed_as"]
     existing = find_drop_campaign(claim_id)
     if existing:  # created just before a restart
+        src.unlink(missing_ok=True)
         _record(claim_id, status="campaign", campaign=existing)
         return "campaigns"
-    src = folder("processed") / rec["claimed_as"]
     try:
         st = os.lstat(src)
     except FileNotFoundError:
         _record(claim_id, status="lost")
-        append_log("mail_log", {"from": SOURCE, "file": rec["file"], "result": "ignored",
-                                "reason": "The file was removed from processed/ before it could be read"})
+        append_log("file_log", {"from": SOURCE, "file": rec["file"], "result": "ignored",
+                                "reason": "The file was removed from the inbox before it could be read"})
         return "rejected"
     if not stat.S_ISREG(st.st_mode):
         return _reject(claim_id, "This is a link or a special file, not a normal file.", "Upload the file itself.")
@@ -282,45 +286,47 @@ def _finish(claim_id: str) -> str:
         return _reject(claim_id, f"This exact file was already received as campaign {dup}, so its candidates "
                                  "were not called again.",
                        "If they should be called again, change the call times in the file and upload it again.")
-    drop = {"claim_id": claim_id, "file": rec["file"], "processed_as": rec["claimed_as"]}
+    drop = {"claim_id": claim_id, "file": rec["file"]}
     try:
         camp = create_campaign(data, rec["file"], source="sftp", drop=drop)
     except SheetError as exc:
         return _reject(claim_id, str(exc))
     except OSError:
-        raise  # our own data folder (disk full?): the file waits in processed/ and is retried next pass
+        raise  # our own data folder (disk full?): the claimed file waits in the inbox, retried next pass
     except Exception as exc:  # a file the reader chokes on: tell the client instead of retrying forever
         log.exception("SFTP folder: couldn't read %s", rec["file"])
         existing = find_drop_campaign(claim_id)
         if existing:
+            src.unlink(missing_ok=True)
             _record(claim_id, status="campaign", campaign=existing)
             return "campaigns"
         return _reject(claim_id, f"This file couldn't be read ({exc.__class__.__name__}).",
                        "Save it again as a UTF-8 .csv (or .xlsx) with the header row, and upload it to the inbox "
                        "folder again.")
+    src.unlink(missing_ok=True)  # the original is kept in data/campaigns/<campaign>/
     _record(claim_id, status="campaign", campaign=camp["campaign_id"])
-    append_log("mail_log", {"from": SOURCE, "file": rec["file"], "result": "campaign",
+    append_log("file_log", {"from": SOURCE, "file": rec["file"], "result": "campaign",
                             "campaign": camp["campaign_id"], "rows": len(camp["rows"]), "status": camp["status"]})
     return "campaigns"
 
 
 def _reject(claim_id: str, reason: str, advice: Optional[str] = None) -> str:
-    """Move the file to errors/ with a note. Safe to repeat after a restart."""
+    """Move the file to failed/ with a note. Safe to repeat after a restart."""
     rec = _claims()[claim_id]
-    moved_to = rec.get("moved_to") or _free_name(folder("errors"), rec["claimed_as"])
+    moved_to = rec.get("moved_to") or _free_name(folder(FAILED), rec["file"])
     if rec["status"] != "rejecting":
         rec = _record(claim_id, status="rejecting", moved_to=moved_to, reason=reason, advice=advice)
-    src = folder("processed") / rec["claimed_as"]
+    src = folder(INBOX) / rec["claimed_as"]
     if os.path.lexists(src):
-        os.rename(src, folder("errors") / moved_to)
+        os.rename(src, folder(FAILED) / moved_to)
     lines = [f"File: {rec['file']}", f"Received: {fmt_local(rec['at'])} (India time)",
              "Result: not processed. No calls were placed.", "", f"Problem: {reason}", "",
              f"What to do: {advice or FIX_AND_RESEND}"]
     if not advice:
         lines += [""] + _format_rules()
-    _write(folder("errors") / f"{moved_to}_ERROR.txt", _text(lines))
+    _write(folder(FAILED) / f"{moved_to}_ERROR.txt", _text(lines))
     _record(claim_id, status="rejected")
-    append_log("mail_log", {"from": SOURCE, "file": rec["file"], "result": "rejected", "reason": reason})
+    append_log("file_log", {"from": SOURCE, "file": rec["file"], "result": "rejected", "reason": reason})
     return "rejected"
 
 
@@ -336,10 +342,13 @@ def result_base(camp: dict) -> str:
 
 
 def deliver(camp: dict, rec: dict) -> str:
-    """Write one queued result (what an email would carry) into the client's SFTP folder:
-    ack/update -> results/<base>_RESULTS, final -> results/<base>_FINAL (the RESULTS file is then removed),
-    rejected (no row could be called) -> errors/<base>_ERRORS plus a note.
+    """Write one queued result file into the client's SFTP folder:
+    ack/update -> send/<base>_RESULTS, final -> send/<base>_FINAL (the RESULTS file is then removed), and with
+    each of them failed/<base>_MISSED_CALLS for the candidates not reached so far;
+    rejected (no row could be called) -> failed/<base>_ERRORS plus a note.
     Returns the copy kept in the campaign's outputs/ for the dashboard."""
+    if not camp.get("drop"):  # never write another campaign's results into the client's folder
+        raise DropError(f"{camp['campaign_id']} didn't come through the SFTP folder")
     check_folders()
     kind, base = rec["kind"], result_base(camp)
     final = kind == "final"
@@ -347,21 +356,37 @@ def deliver(camp: dict, rec: dict) -> str:
              for ext in result_formats()}
     if kind == "rejected":
         for ext, data in built.items():
-            _write(folder("errors") / f"{base}_ERRORS.{ext}", data)
-        _write(folder("errors") / f"{base}_ERRORS.txt", _text(_rejected_note(camp, base)))
+            _write(folder(FAILED) / f"{base}_ERRORS.{ext}", data)
+        _write(folder(FAILED) / f"{base}_ERRORS.txt", _text(_rejected_note(camp, base)))
     else:
         label = "FINAL" if final else "RESULTS"
         for ext, data in built.items():
-            _write(folder("results") / f"{base}_{label}.{ext}", data)
+            _write(folder(SEND) / f"{base}_{label}.{ext}", data)
         if final:  # one file per campaign: the in-progress one is replaced by the final one
             for ext in ("csv", "xlsx"):
-                (folder("results") / f"{base}_RESULTS.{ext}").unlink(missing_ok=True)
+                (folder(SEND) / f"{base}_RESULTS.{ext}").unlink(missing_ok=True)
+        _write_missed(camp, base)
     ext = next(iter(built))
     saved = output_name(camp, "check" if kind == "rejected" else kind, rec.get("update_no"), ext)
     out = campaign_dir(camp["campaign_id"]) / "outputs"
     out.mkdir(exist_ok=True)
     (out / saved).write_bytes(built[ext])
     return f"outputs/{saved}"
+
+
+def _write_missed(camp: dict, base: str) -> None:
+    """failed/<base>_MISSED_CALLS: the candidates whose calls are finished without reaching them (no answer, busy,
+    failed, under review, not called), with the same columns as the output sheet. Rewritten with every output
+    sheet, and removed if a late result means everyone was reached after all."""
+    headers, lines = result_table(camp, NOT_CONNECTED)
+    for ext in ("csv", "xlsx"):
+        path = folder(FAILED) / f"{base}_MISSED_CALLS.{ext}"
+        if not lines or ext not in result_formats():
+            path.unlink(missing_ok=True)
+        elif ext == "csv":
+            _write(path, build_results_csv(camp, NOT_CONNECTED))
+        else:
+            _write(path, build_table_xlsx(headers, lines, "Missed calls"))
 
 
 def _rejected_note(camp: dict, base: str) -> list[str]:

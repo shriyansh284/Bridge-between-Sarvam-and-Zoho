@@ -5,9 +5,8 @@ Background work. Runs inside server.py by default, or on its own:
     python -m ams.scheduler --once   # one pass (testing)
 
 Every SCHEDULER_POLL_SECONDS: flag lost results, place due calls, fetch finished calls'
-results from Sarvam (at most every RESULT_POLL_SECONDS), send due emails.
-Every MAIL_POLL_SECONDS: read new emails from the Zoho inbox.
-Every DROP_POLL_SECONDS (only when DROP_DIR is set): pick up files the client uploaded over SFTP.
+results from Sarvam (at most every RESULT_POLL_SECONDS), write due result files.
+Every DROP_POLL_SECONDS: pick up files the client uploaded to the SFTP folder.
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ from .campaigns import (claim_row, due_row_ids, flag_stale, refresh_status, trig
                         trigger_succeeded, trigger_uncertain)
 from .config import settings
 from .dropfolder import poll_drop
-from .mailer import ensure_mail_cutoff, poll_inbox, send_due_emails
+from .outbox import send_due_results
 from .results import last_ok_poll, poll_results, seen_attempts
 from .sarvam import SarvamError, place_call
 from .store import campaign_dir, campaign_tx, get_status, list_campaign_ids, set_status
@@ -111,13 +110,13 @@ def run_cycle() -> dict:
             _pause_calls("Sarvam refused reading call results: " + fetched["auth_error"])
     except Exception:
         log.exception("Fetching call results failed; retrying next cycle")
-    stats["emails"] = send_due_emails()
+    stats["files"] = send_due_results()
     set_status("scheduler_heartbeat", iso(utcnow()))
     return stats
 
 
 class Background:
-    """Two daemon threads: calls/emails loop and inbox loop."""
+    """Two daemon threads: calls + result files, and the SFTP folder."""
 
     def __init__(self):
         self._stop = threading.Event()
@@ -135,17 +134,15 @@ class Background:
 
     def start(self):
         set_status("calls_paused", None)  # a restart picks up a fixed .env
-        ensure_mail_cutoff()
         missing = settings.missing_for_calling()
         if missing:
             log.warning("Calls can't be placed until these are set (rows keep waiting): %s", ", ".join(missing))
-        if settings.mail_enabled and settings.missing_for_mail():
-            log.warning("Inbox can't be read until these are set: %s", ", ".join(settings.missing_for_mail()))
-        loops = [(run_cycle, settings.scheduler_poll_seconds, "scheduler"),
-                 (poll_inbox, settings.mail_poll_seconds, "inbox")]
+        loops = [(run_cycle, settings.scheduler_poll_seconds, "scheduler")]
         if settings.drop_dir:
             loops.append((poll_drop, settings.drop_poll_seconds, "sftp-folder"))
             log.info("Watching the SFTP folder %s/inbox every %s sec", settings.drop_dir, settings.drop_poll_seconds)
+        else:
+            log.warning("DROP_DIR isn't set in .env, so no client files are picked up (deploy/setup_sftp.sh sets it)")
         for fn, every, name in loops:
             t = threading.Thread(target=self._loop, args=(fn, every, name), name=name, daemon=True)
             t.start()
@@ -163,8 +160,6 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.once:
-        ensure_mail_cutoff()
-        log.info("inbox: %s", poll_inbox())
         if settings.drop_dir:
             log.info("sftp folder: %s", poll_drop())
         log.info("cycle: %s", run_cycle())
