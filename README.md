@@ -126,7 +126,7 @@ With `MOCK_RESULT=digit`, a phone ending in 1 gives "no answer", 2 gives "busy",
 
 ### Step 6: Deploy
 
-On an Ubuntu/Debian server, `sudo bash deploy/setup_server.sh` installs and starts the app, then `sudo DROP_DIR=/backend/fileupload CLIENT_IPS=<client IP> bash deploy/setup_sftp.sh` creates the three folders in `DROP_DIR` (any path you like) and sets it in `.env`. It also creates the client's SFTP login, locked into that folder; if the client already has an SFTP login that uploads there, add `EXISTING_LOGIN=yes SFTP_USER=<their login>` and it only grants that login and the app access to the folders, leaving SSH untouched. The server administrator's step-by-step guides, with every choice (install folder, ports, service account, backups) and the manual version of both scripts, are `sysadmin/DEPLOYMENT.md` and `sysadmin/SFTP_SETUP.md`. They are kept out of git and shared directly. In short, without the scripts:
+On an Ubuntu/Debian server, `sudo bash deploy/setup_server.sh` installs and starts the app, then `sudo DROP_DIR=/backend/fileupload CLIENT_IPS=<client IP> bash deploy/setup_sftp.sh` creates the three folders in `DROP_DIR` (any path you like) and sets it in `.env`. It also creates the client's SFTP login, locked into that folder. The server administrator's guides, `sysadmin/DEPLOYMENT.md` and `sysadmin/SFTP_SETUP.md`, give the same setup as numbered manual steps with every choice explained; they are kept out of git and shared directly. In short, without the scripts:
 
 The backend must run continuously on one server with a persistent `data/` folder. The dashboard runs on the same server because it reads the same files. From the project folder, with the venv active, run these two processes:
 
